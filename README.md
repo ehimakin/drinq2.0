@@ -1,9 +1,37 @@
-<<<<<<< HEAD
 # Drinq 2.0
 
-Cross-platform mobile and backend app for bar-to-customer promotions.
-=======
-# Drinq
+Unified repository for Drinq's cross-platform app and API.
 
-Cross-platform mobile app connecting customers and bars/restaurants.
->>>>>>> 706f2eb244c227e3539e557bf004c6a7ca95b91f
+## Monorepo Layout
+
+- `apps/mobile` Expo + React Native app (iOS, Android, Web)
+- `apps/api` FastAPI backend
+- `apps/web` reserved for dedicated web app (if needed later)
+- `packages/shared` shared types/schemas/utilities
+- `docs` product and architecture notes
+- `scripts` project scripts and legacy utilities
+
+## Quick Start
+
+### 1) Mobile app (Expo)
+
+```bash
+cd apps/mobile
+npm install
+npm run start
+```
+
+### 2) API (FastAPI)
+
+```bash
+cd apps/api
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn src.main:app --reload --port 8000
+```
+
+## Notes
+
+- Current mobile feature code includes the Pintless waiting game.
+- API includes the matching Pintless endpoints under `/games/pintless/*`.

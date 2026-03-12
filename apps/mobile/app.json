@@ -1,0 +1,16 @@
+{
+  "expo": {
+    "name": "Drinq",
+    "slug": "drinq-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "platforms": [
+      "ios",
+      "android",
+      "web"
+    ],
+    "assetBundlePatterns": [
+      "**/*"
+    ]
+  }
+}
