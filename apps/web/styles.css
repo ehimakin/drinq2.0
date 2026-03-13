@@ -1,0 +1,276 @@
+:root {
+  --bg: #08090a;
+  --card: #15181b;
+  --text: #f6f7f8;
+  --muted: #a7adb4;
+  --accent: #f42534;
+  --accent-2: #ffd54a;
+  --ok: #3fd17f;
+  --radius: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: radial-gradient(circle at 15% -20%, #2a2d31, var(--bg) 40%);
+  color: var(--text);
+  font-family: "Avenir Next", "Segoe UI", Arial, sans-serif;
+}
+
+#app {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.hero {
+  background: linear-gradient(145deg, #14181d, #0e1114);
+  border: 1px solid #2c3137;
+  border-radius: 18px;
+  padding: 18px;
+  margin-bottom: 16px;
+}
+
+.brand-chip {
+  display: inline-block;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: #1e242b;
+  color: var(--accent-2);
+  font-weight: 700;
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+
+.venue-title {
+  margin: 0 0 6px;
+  font-size: 28px;
+}
+
+.venue-copy {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.modes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+  margin: 16px 0 18px;
+}
+
+.mode {
+  border: 1px solid #343a41;
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: #14181d;
+}
+
+.mode h4 {
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+
+.mode p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.menu-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 12px;
+}
+
+.item {
+  background: var(--card);
+  border: 1px solid #31353b;
+  border-radius: var(--radius);
+  padding: 12px;
+}
+
+.item h3 {
+  margin: 0 0 4px;
+  font-size: 18px;
+}
+
+.item-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+
+.price {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.option-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.option-list li {
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.option-list b {
+  color: var(--ok);
+}
+
+.add-btn {
+  margin-top: 8px;
+  width: 100%;
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-weight: 700;
+  background: var(--accent);
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.cart-mini {
+  position: sticky;
+  bottom: 12px;
+  margin-top: 14px;
+  background: #1a1f25;
+  border: 1px solid #343a41;
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 14px;
+}
+
+.unknown {
+  background: #261317;
+  border: 1px solid #4d272d;
+  color: #ffbac0;
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.inline-btn {
+  margin-left: 8px;
+  border: 0;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-weight: 700;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
+.inline-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.inline-btn.ghost {
+  background: #31353b;
+}
+
+.form-card {
+  background: var(--card);
+  border: 1px solid #31353b;
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-bottom: 12px;
+}
+
+.form-card h2 {
+  margin: 0 0 10px;
+}
+
+label {
+  display: block;
+  margin: 10px 0 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+input,
+select {
+  width: 100%;
+  border: 1px solid #343a41;
+  border-radius: 10px;
+  background: #0f1215;
+  color: var(--text);
+  padding: 10px;
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.checkbox input {
+  width: auto;
+}
+
+.summary-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.summary-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  padding: 6px 0;
+  border-bottom: 1px solid #252a30;
+}
+
+.summary-total {
+  margin-top: 10px;
+  font-size: 16px;
+}
+
+.status-msg {
+  margin-top: 10px;
+  color: var(--ok);
+}
+
+.status-msg.error {
+  color: #ff6f79;
+}
+
+.api-note {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 10px;
+}
+
+.runner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.runner-actions .inline-btn {
+  margin-left: 0;
+}
+
+.runner-link {
+  display: inline-block;
+  margin-top: 10px;
+  color: var(--accent-2);
+  text-decoration: none;
+  font-weight: 600;
+}
