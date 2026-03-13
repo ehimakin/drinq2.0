@@ -256,6 +256,11 @@ select {
   margin-top: 10px;
 }
 
+.completion-card {
+  border-color: #2f5e46;
+  background: linear-gradient(145deg, #123221, #10261a);
+}
+
 .runner-actions {
   display: flex;
   flex-wrap: wrap;

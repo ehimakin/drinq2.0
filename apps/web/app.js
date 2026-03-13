@@ -460,12 +460,26 @@ async function renderOrderStatus(venueSlug, orderId, apiBase) {
       throw new Error(`Not found (${res.status})`);
     }
     const data = await res.json();
+    const isFulfilled = data.status === "fulfilled";
     app.innerHTML = `
       <section class="hero">
         <span class="brand-chip">ORDER STATUS</span>
         <h1 class="venue-title">Order #${data.order_id}</h1>
         <p class="venue-copy">Status: <strong>${escapeHtml(data.status)}</strong> · ETA: ${escapeHtml(data.eta_text)}</p>
       </section>
+
+      ${
+        isFulfilled
+          ? `
+      <section class="form-card completion-card">
+        <h2>Order Complete</h2>
+        <p>Your order has been fulfilled. Enjoy your drink.</p>
+        <button class="inline-btn" id="tipRunnerBtn">Tip Runner</button>
+        <button class="inline-btn ghost" id="reorderBtn">Reorder</button>
+      </section>
+      `
+          : ""
+      }
 
       <section class="form-card">
         <h2>Delivery</h2>
@@ -493,6 +507,20 @@ async function renderOrderStatus(venueSlug, orderId, apiBase) {
       renderOrderStatus(venueSlug, orderId, apiBase);
     });
     document.getElementById("backToMenuBtn")?.addEventListener("click", () => setRoute("/"));
+    document.getElementById("tipRunnerBtn")?.addEventListener("click", () => {
+      alert("Thanks. Tip flow placeholder for prototype.");
+    });
+    document.getElementById("reorderBtn")?.addEventListener("click", () => {
+      const reordered = (data.items || []).map((item) => ({
+        item_id: item.item_id,
+        item_name: item.item_name,
+        price_text: item.price_text,
+        price_pennies: parsePriceToPennies(item.price_text),
+        quantity: Number(item.quantity) || 1
+      }));
+      writeCart(venueSlug, reordered);
+      setRoute("/checkout");
+    });
   } catch (error) {
     app.innerHTML = `
       <section class="unknown">
