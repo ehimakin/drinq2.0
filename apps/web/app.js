@@ -2,6 +2,8 @@ import { VENUES } from "./data/venues.js";
 
 const app = document.getElementById("app");
 const STAFF_SESSION_KEY = "drinq_staff_session";
+const REORDER_ROUND_KEY_PREFIX = "drinq_reorder_round_";
+const CUSTOMER_PROFILE_KEY_PREFIX = "drinq_customer_profile_";
 // DEV ONLY: local staff PIN flow is enabled for prototype testing.
 // Replace with proper auth before production.
 
@@ -101,6 +103,14 @@ function cartKey(venueSlug) {
   return `drinq_cart_${venueSlug}`;
 }
 
+function reorderRoundKey(venueSlug) {
+  return `${REORDER_ROUND_KEY_PREFIX}${venueSlug}`;
+}
+
+function customerProfileKey(venueSlug) {
+  return `${CUSTOMER_PROFILE_KEY_PREFIX}${venueSlug}`;
+}
+
 function readCart(venueSlug) {
   try {
     const raw = localStorage.getItem(cartKey(venueSlug));
@@ -119,6 +129,92 @@ function writeCart(venueSlug, items) {
 
 function clearCart(venueSlug) {
   localStorage.removeItem(cartKey(venueSlug));
+}
+
+function readReorderRound(venueSlug) {
+  try {
+    const raw = sessionStorage.getItem(reorderRoundKey(venueSlug));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed;
+  } catch {
+    return [];
+  }
+}
+
+function writeReorderRound(venueSlug, items) {
+  sessionStorage.setItem(reorderRoundKey(venueSlug), JSON.stringify(items));
+}
+
+function clearReorderRound(venueSlug) {
+  sessionStorage.removeItem(reorderRoundKey(venueSlug));
+}
+
+function readCustomerProfile(venueSlug) {
+  try {
+    const raw = localStorage.getItem(customerProfileKey(venueSlug));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      customerId: Number(parsed.customerId || 0) || null,
+      token: String(parsed.token || ""),
+      name: String(parsed.name || ""),
+      email: String(parsed.email || ""),
+      deliveryMode: String(parsed.deliveryMode || ""),
+      deliveryTarget: String(parsed.deliveryTarget || ""),
+      checkoutType: String(parsed.checkoutType || "remembered")
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeCustomerProfile(venueSlug, profile) {
+  localStorage.setItem(customerProfileKey(venueSlug), JSON.stringify(profile));
+}
+
+function clearCustomerProfile(venueSlug) {
+  localStorage.removeItem(customerProfileKey(venueSlug));
+}
+
+async function hydrateCustomerProfile(apiBase, venueSlug) {
+  const localProfile = readCustomerProfile(venueSlug);
+  if (!localProfile?.token) return localProfile;
+
+  try {
+    const response = await fetch(
+      `${apiBase}/api/customers/profile?venue_slug=${encodeURIComponent(venueSlug)}`,
+      {
+        headers: { "X-Customer-Token": localProfile.token },
+        cache: "no-store"
+      }
+    );
+
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 404) {
+        clearCustomerProfile(venueSlug);
+        return null;
+      }
+      return localProfile;
+    }
+
+    const remoteProfile = await response.json();
+    const mergedProfile = {
+      customerId: Number(remoteProfile.customer_id || 0) || null,
+      token: String(remoteProfile.customer_token || localProfile.token || ""),
+      name: String(remoteProfile.name || ""),
+      email: String(remoteProfile.email || ""),
+      deliveryMode: String(remoteProfile.delivery_mode || ""),
+      deliveryTarget: String(remoteProfile.delivery_target || ""),
+      checkoutType: "remembered"
+    };
+    writeCustomerProfile(venueSlug, mergedProfile);
+    return mergedProfile;
+  } catch {
+    return localProfile;
+  }
 }
 
 function itemCount(items) {
@@ -221,6 +317,7 @@ function renderVenueMenu(venueSlug, venue, role, apiBase) {
   const canRunner = permissions.runner && Boolean(runnerAuth);
   const canVenue = permissions.venue && Boolean(venueAuth);
   const cart = readCart(venueSlug);
+  const reorderRound = readReorderRound(venueSlug);
   const count = itemCount(cart);
   const total = formatPennies(totalPennies(cart));
 
@@ -263,6 +360,11 @@ function renderVenueMenu(venueSlug, venue, role, apiBase) {
 
     <section class="cart-mini">
       Cart: <strong>${count} item${count === 1 ? "" : "s"}</strong> · ${total}
+      ${
+        reorderRound.length > 0
+          ? `<button class="inline-btn ghost" id="reorderRoundBtn">Reorder Round</button>`
+          : ""
+      }
       <button class="inline-btn" id="goCheckoutBtn" ${count === 0 ? "disabled" : ""}>Go To Checkout</button>
       ${canVenue ? `<button class="inline-btn ghost" id="goVenueBtn">Venue Ops</button>` : ""}
       ${canRunner ? `<button class="inline-btn ghost" id="goRunnerBtn">Runner Dashboard</button>` : ""}
@@ -296,6 +398,12 @@ function renderVenueMenu(venueSlug, venue, role, apiBase) {
     });
   }
 
+  document.getElementById("reorderRoundBtn")?.addEventListener("click", () => {
+    writeCart(venueSlug, reorderRound);
+    clearReorderRound(venueSlug);
+    renderVenueMenu(venueSlug, venue, role, apiBase);
+  });
+
   if (canRunner) {
     document.getElementById("goRunnerBtn")?.addEventListener("click", () => setRoute("/runner"));
   }
@@ -317,8 +425,9 @@ function renderVenueMenu(venueSlug, venue, role, apiBase) {
   });
 }
 
-function renderCheckout(venueSlug, venue, apiBase) {
+async function renderCheckout(venueSlug, venue, apiBase) {
   const cart = readCart(venueSlug);
+  const savedProfile = await hydrateCustomerProfile(apiBase, venueSlug);
   if (cart.length === 0) {
     app.innerHTML = `
       <section class="hero">
@@ -332,6 +441,8 @@ function renderCheckout(venueSlug, venue, apiBase) {
   }
 
   const total = formatPennies(totalPennies(cart));
+  const hasRememberedProfile = Boolean(savedProfile?.token);
+  const defaultCheckoutType = hasRememberedProfile ? "remembered" : "guest";
 
   app.innerHTML = `
     <section class="hero">
@@ -355,20 +466,54 @@ function renderCheckout(venueSlug, venue, apiBase) {
 
     <section class="form-card">
       <h2>Contact + Delivery</h2>
+      <p class="api-note">
+        ${
+          hasRememberedProfile
+            ? "Recognized customer profile loaded for faster checkout on this device."
+            : "First order? Choose guest checkout or let Drinq remember your details for faster future orders."
+        }
+      </p>
       <form id="checkoutForm">
+        <input type="hidden" name="checkoutType" value="${defaultCheckoutType}" />
+        ${
+          hasRememberedProfile
+            ? `
+          <div class="choice-note">
+            <strong>Remembered customer</strong><br />
+            Future orders on this device can prefill your delivery details automatically.
+          </div>
+        `
+            : `
+          <div class="checkout-choice-grid" id="checkoutChoiceGrid">
+            <button class="choice-btn choice-btn-selected" type="button" data-checkout-type="guest">
+              <strong>Checkout As Guest</strong><br />
+              Place this order without saving a customer profile.
+            </button>
+            <button class="choice-btn" type="button" data-checkout-type="remembered">
+              <strong>Faster Future Orders</strong><br />
+              Save contact and delivery details silently for next time.
+            </button>
+          </div>
+        `
+        }
         <label>Name</label>
-        <input name="name" required placeholder="Your name" />
+        <input name="name" required placeholder="Your name" value="${escapeHtml(savedProfile?.name || "")}" />
 
         <label>Email</label>
-        <input name="email" required type="email" placeholder="name@email.com" />
+        <input name="email" required type="email" placeholder="name@email.com" value="${escapeHtml(savedProfile?.email || "")}" />
 
         <label>Delivery Mode</label>
         <select name="deliveryMode" required>
-          ${venue.fulfillmentModes.map((m) => `<option value="${m.label}">${m.label} (${m.eta}, ${m.fee})</option>`).join("")}
+          ${venue.fulfillmentModes
+            .map((m) => {
+              const selected = savedProfile?.deliveryMode === m.label ? "selected" : "";
+              return `<option value="${m.label}" ${selected}>${m.label} (${m.eta}, ${m.fee})</option>`;
+            })
+            .join("")}
         </select>
 
         <label>Seat / Pickup Point</label>
-        <input name="deliveryTarget" required placeholder="E.g. Block N220, Row 6, Seat 121" />
+        <input name="deliveryTarget" required placeholder="E.g. Block N220, Row 6, Seat 121" value="${escapeHtml(savedProfile?.deliveryTarget || "")}" />
 
         <label class="checkbox">
           <input type="checkbox" name="mailingList" checked />
@@ -377,6 +522,7 @@ function renderCheckout(venueSlug, venue, apiBase) {
 
         <button class="add-btn" type="submit">Pay & Place Order</button>
         <button class="inline-btn ghost" type="button" id="backMenuBtn">Back To Menu</button>
+        <button class="inline-btn ghost" type="button" id="forgetDetailsBtn">Forget Saved Details</button>
       </form>
       <p class="api-note">API: ${escapeHtml(apiBase)}</p>
       <p id="checkoutMsg" class="status-msg"></p>
@@ -384,6 +530,22 @@ function renderCheckout(venueSlug, venue, apiBase) {
   `;
 
   document.getElementById("backMenuBtn")?.addEventListener("click", () => setRoute("/"));
+  document.getElementById("forgetDetailsBtn")?.addEventListener("click", () => {
+    clearCustomerProfile(venueSlug);
+    renderCheckout(venueSlug, venue, apiBase);
+  });
+
+  const checkoutTypeInput = document.querySelector('input[name="checkoutType"]');
+  const choiceButtons = document.querySelectorAll("[data-checkout-type]");
+  choiceButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      const checkoutType = button.getAttribute("data-checkout-type");
+      if (!checkoutTypeInput || !checkoutType) return;
+      checkoutTypeInput.value = checkoutType;
+      choiceButtons.forEach((other) => other.classList.remove("choice-btn-selected"));
+      button.classList.add("choice-btn-selected");
+    });
+  });
 
   const form = document.getElementById("checkoutForm");
   const message = document.getElementById("checkoutMsg");
@@ -398,9 +560,14 @@ function renderCheckout(venueSlug, venue, apiBase) {
     const email = String(formData.get("email") || "").trim();
     const deliveryMode = String(formData.get("deliveryMode") || "").trim();
     const deliveryTarget = String(formData.get("deliveryTarget") || "").trim();
+    const checkoutType = String(formData.get("checkoutType") || defaultCheckoutType).trim();
     const mailingList = Boolean(formData.get("mailingList"));
 
     try {
+      if (checkoutType === "guest") {
+        clearCustomerProfile(venueSlug);
+      }
+
       if (mailingList) {
         await fetch(`${apiBase}/api/register`, {
           method: "POST",
@@ -427,7 +594,9 @@ function renderCheckout(venueSlug, venue, apiBase) {
             item_name: item.item_name,
             price_text: item.price_text,
             quantity: item.quantity
-          }))
+          })),
+          checkout_type: checkoutType,
+          customer_token: savedProfile?.token || null
         })
       });
 
@@ -436,6 +605,17 @@ function renderCheckout(venueSlug, venue, apiBase) {
       }
 
       const orderData = await orderRes.json();
+      if (checkoutType === "remembered" && orderData.customer_profile) {
+        writeCustomerProfile(venueSlug, {
+          customerId: Number(orderData.customer_profile.customer_id || 0) || null,
+          token: String(orderData.customer_profile.customer_token || ""),
+          name,
+          email,
+          deliveryMode,
+          deliveryTarget,
+          checkoutType
+        });
+      }
       clearCart(venueSlug);
       setRoute(`/order-status/${orderData.order_id}`);
     } catch (error) {
@@ -445,7 +625,7 @@ function renderCheckout(venueSlug, venue, apiBase) {
   });
 }
 
-async function renderOrderStatus(venueSlug, orderId, apiBase) {
+async function renderOrderStatus(venueSlug, orderId, apiBase, role) {
   app.innerHTML = `
     <section class="hero">
       <span class="brand-chip">ORDER STATUS</span>
@@ -455,12 +635,94 @@ async function renderOrderStatus(venueSlug, orderId, apiBase) {
   `;
 
   try {
-    const res = await fetch(`${apiBase}/api/order-status/${orderId}`);
+    const res = await fetch(`${apiBase}/api/order-status/${orderId}?t=${Date.now()}`, {
+      cache: "no-store"
+    });
     if (!res.ok) {
       throw new Error(`Not found (${res.status})`);
     }
     const data = await res.json();
-    const isFulfilled = data.status === "fulfilled";
+    const status = String(data.status || "").toLowerCase();
+    const isCustomerView = role === "customer";
+    const isFulfilled = status === "fulfilled";
+    const isTerminal = ["fulfilled", "rejected", "cancelled", "failed"].includes(status);
+    if (isCustomerView && isFulfilled) {
+      app.innerHTML = `
+        <section class="hero">
+          <span class="brand-chip">ORDER COMPLETE</span>
+          <h1 class="venue-title">Order #${data.order_id}</h1>
+          <p class="venue-copy">It's been delivered!</p>
+        </section>
+
+        <section class="form-card completion-card">
+          <h2>It's been delivered!</h2>
+          <p>Your order is complete.</p>
+          <button class="inline-btn" id="tipRunnerBtn">Tip Runner</button>
+          <button class="inline-btn ghost" id="reorderBtn">Order Again</button>
+        </section>
+
+        <section class="form-card">
+          <h2>Delivery</h2>
+          <p><strong>Mode:</strong> ${escapeHtml(data.delivery_mode)}</p>
+          <p><strong>Target:</strong> ${escapeHtml(data.delivery_target)}</p>
+          <p><strong>Customer:</strong> ${escapeHtml(data.customer_name)} (${escapeHtml(data.customer_email)})</p>
+        </section>
+
+        <section class="form-card">
+          <h2>Items</h2>
+          <ul class="summary-list">
+            ${data.items
+              .map((item) => `<li>${escapeHtml(item.item_name)} x${item.quantity}<span>${escapeHtml(item.price_text)}</span></li>`)
+              .join("")}
+          </ul>
+        </section>
+      `;
+
+      document.getElementById("tipRunnerBtn")?.addEventListener("click", () => {
+        alert("Thanks. Tip flow placeholder for prototype.");
+      });
+      document.getElementById("reorderBtn")?.addEventListener("click", () => {
+        const reordered = (data.items || []).map((item) => ({
+          item_id: item.item_id,
+          item_name: item.item_name,
+          price_text: item.price_text,
+          price_pennies: parsePriceToPennies(item.price_text),
+          quantity: Number(item.quantity) || 1
+        }));
+        clearCart(venueSlug);
+        writeReorderRound(venueSlug, reordered);
+        setRoute("/");
+      });
+      return;
+    }
+
+    const completionBlock = isTerminal
+      ? isCustomerView
+        ? `
+      <section class="form-card completion-card">
+        <h2>${isFulfilled ? "Order Complete" : "Order Closed"}</h2>
+        <p>${
+          isFulfilled
+            ? "Delivered successfully."
+            : `This order has now ${escapeHtml(status)}.`
+        }</p>
+        ${
+          isFulfilled
+            ? `<button class="inline-btn" id="tipRunnerBtn">Tip Runner</button>
+               <button class="inline-btn ghost" id="reorderBtn">Order Again</button>`
+            : `<button class="inline-btn ghost" id="reorderBtn">Start New Order</button>
+               `
+        }
+      </section>
+      `
+        : `
+      <section class="form-card">
+        <h2>Order Update</h2>
+        <p>Order status is <strong>${escapeHtml(status)}</strong>.</p>
+      </section>
+      `
+      : "";
+
     app.innerHTML = `
       <section class="hero">
         <span class="brand-chip">ORDER STATUS</span>
@@ -468,18 +730,7 @@ async function renderOrderStatus(venueSlug, orderId, apiBase) {
         <p class="venue-copy">Status: <strong>${escapeHtml(data.status)}</strong> · ETA: ${escapeHtml(data.eta_text)}</p>
       </section>
 
-      ${
-        isFulfilled
-          ? `
-      <section class="form-card completion-card">
-        <h2>Order Complete</h2>
-        <p>Your order has been fulfilled. Enjoy your drink.</p>
-        <button class="inline-btn" id="tipRunnerBtn">Tip Runner</button>
-        <button class="inline-btn ghost" id="reorderBtn">Reorder</button>
-      </section>
-      `
-          : ""
-      }
+      ${completionBlock}
 
       <section class="form-card">
         <h2>Delivery</h2>
@@ -504,7 +755,7 @@ async function renderOrderStatus(venueSlug, orderId, apiBase) {
     `;
 
     document.getElementById("refreshStatusBtn")?.addEventListener("click", () => {
-      renderOrderStatus(venueSlug, orderId, apiBase);
+      renderOrderStatus(venueSlug, orderId, apiBase, role);
     });
     document.getElementById("backToMenuBtn")?.addEventListener("click", () => setRoute("/"));
     document.getElementById("tipRunnerBtn")?.addEventListener("click", () => {
@@ -518,8 +769,9 @@ async function renderOrderStatus(venueSlug, orderId, apiBase) {
         price_pennies: parsePriceToPennies(item.price_text),
         quantity: Number(item.quantity) || 1
       }));
-      writeCart(venueSlug, reordered);
-      setRoute("/checkout");
+      clearCart(venueSlug);
+      writeReorderRound(venueSlug, reordered);
+      setRoute("/");
     });
   } catch (error) {
     app.innerHTML = `
@@ -613,7 +865,6 @@ async function renderRunnerDashboard(venueSlug, apiBase, authHeader) {
           <p><strong>Mode:</strong> ${escapeHtml(order.delivery_mode)} · <strong>ETA:</strong> ${escapeHtml(order.eta_text)}</p>
           <p><strong>Target:</strong> ${escapeHtml(order.delivery_target)}</p>
           ${runnerStatusButtons(order.order_id)}
-          <a class="runner-link" href="#/order-status/${order.order_id}">Open order status page</a>
         </article>
       `
       )
@@ -684,7 +935,6 @@ async function renderVenueDashboard(venueSlug, apiBase, authHeader) {
           <p><strong>Mode:</strong> ${escapeHtml(order.delivery_mode)} · <strong>ETA:</strong> ${escapeHtml(order.eta_text)}</p>
           <p><strong>Target:</strong> ${escapeHtml(order.delivery_target)}</p>
           ${venueStatusButtons(order.order_id, order.status)}
-          <a class="runner-link" href="#/order-status/${order.order_id}">Open order status page</a>
         </article>
       `
       )
@@ -703,7 +953,7 @@ async function renderVenueDashboard(venueSlug, apiBase, authHeader) {
           if (!update.ok) {
             throw new Error(`Action failed (${update.status})`);
           }
-          renderVenueDashboard(venueSlug, apiBase);
+          renderVenueDashboard(venueSlug, apiBase, authHeader);
         } catch (error) {
           alert(`Could not perform venue action: ${error.message}`);
           btn.disabled = false;
@@ -733,7 +983,7 @@ async function render() {
     return;
   }
   if (route.name === "order-status") {
-    await renderOrderStatus(venueSlug, route.orderId, apiBase);
+    await renderOrderStatus(venueSlug, route.orderId, apiBase, role);
     return;
   }
   if (route.name === "runner") {

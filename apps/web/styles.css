@@ -190,6 +190,44 @@ body {
   margin-bottom: 12px;
 }
 
+.checkout-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  margin: 14px 0 12px;
+}
+
+.choice-btn {
+  border: 1px solid #343a41;
+  border-radius: 12px;
+  padding: 12px;
+  background: #0f1215;
+  color: var(--text);
+  text-align: left;
+  line-height: 1.45;
+  cursor: pointer;
+}
+
+.choice-btn strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.choice-btn-selected {
+  border-color: var(--accent);
+  background: #231115;
+  box-shadow: inset 0 0 0 1px rgba(244, 37, 52, 0.25);
+}
+
+.choice-note {
+  margin: 14px 0 12px;
+  border: 1px solid #2f5e46;
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(63, 209, 127, 0.08);
+  color: var(--text);
+}
+
 .form-card h2 {
   margin: 0 0 10px;
 }
