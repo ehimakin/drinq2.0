@@ -4,6 +4,19 @@ export const VENUES = {
     tag: "MATCHDAY PARTNER",
     subtitle:
       "Don't queue. Order drinks to your seat, nearest point, or collect at your pace.",
+    branding: {
+      eyebrow: "Brentford Matchday Service",
+      heroTitle: "Stadium pours without the concourse queue",
+      heroCopy:
+        "Built for fast rounds, moving crowds, and keeping supporters in the moment from kickoff to full time.",
+      staffCopy:
+        "Venue-specific live operations for Brentford FC matchday service.",
+      logo: "/assets/drinq-wordmark.webp?v=20260314b",
+      mark: "BFC",
+      accent: "#b31942",
+      accentSoft: "#f2d5dd",
+      glow: "rgba(179, 25, 66, 0.16)"
+    },
     fulfillmentModes: [
       {
         label: "Seat Delivery",
@@ -44,7 +57,7 @@ export const VENUES = {
         name: "Gin & Tonic",
         category: "Spirits",
         price: "PS8.20",
-        options: ["Seat Delivery", "Nearest Point"]
+        options: ["Seat Delivery", "Nearest Point", "Click & Collect"]
       },
       {
         id: "bf-soft",

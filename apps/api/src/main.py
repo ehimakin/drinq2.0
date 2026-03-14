@@ -5,9 +5,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from src.mobile.games.trivia.pintless.api import router as pintless_router
 
 app = FastAPI(title="Drinq API")
@@ -22,28 +22,35 @@ app.add_middleware(
 )
 
 DB_PATH = Path(__file__).resolve().parents[1] / "drinq.sqlite3"
+PaymentStatus = Literal["pending", "captured", "failed", "refunded"]
 OrderStatus = Literal[
     "received",
     "accepted",
     "ready",
+    "ready_for_collection",
     "assigned",
     "loaded",
     "en_route",
     "arrived",
+    "collected",
+    "uncollected",
     "fulfilled",
     "rejected",
     "cancelled",
     "failed",
 ]
-TERMINAL_STATUSES = {"fulfilled", "rejected", "cancelled", "failed"}
+TERMINAL_STATUSES = {"fulfilled", "collected", "uncollected", "rejected", "cancelled", "failed"}
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "received": {"accepted", "rejected", "cancelled"},
-    "accepted": {"ready", "assigned", "cancelled"},
+    "accepted": {"ready", "ready_for_collection", "assigned", "cancelled"},
     "ready": {"assigned", "loaded", "cancelled"},
+    "ready_for_collection": {"collected", "uncollected", "cancelled"},
     "assigned": {"loaded", "en_route", "cancelled"},
     "loaded": {"en_route", "arrived", "cancelled"},
     "en_route": {"arrived", "failed", "cancelled"},
     "arrived": {"fulfilled", "failed", "cancelled"},
+    "collected": set(),
+    "uncollected": set(),
     "fulfilled": set(),
     "rejected": set(),
     "cancelled": set(),
@@ -59,6 +66,7 @@ ACTIVE_CUSTOMER_ORDER_STATUSES = (
     "received",
     "accepted",
     "ready",
+    "ready_for_collection",
     "assigned",
     "loaded",
     "en_route",
@@ -109,10 +117,22 @@ class StaffAuthRequest(BaseModel):
     role: Literal["runner", "venue", "admin"]
 
 
+class CollectVerificationRequest(BaseModel):
+    pickup_code: str
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+async def parse_request_model(request: Request, model: type[BaseModel]) -> BaseModel:
+    raw_body = await request.body()
+    try:
+        return model.model_validate_json(raw_body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
 
 def init_db() -> None:
@@ -161,6 +181,11 @@ def init_db() -> None:
           customer_id INTEGER,
           assigned_runner_token TEXT,
           assigned_runner_role TEXT,
+          pickup_code TEXT,
+          ready_for_collection_at TEXT,
+          payment_status TEXT NOT NULL DEFAULT 'captured',
+          payment_reference TEXT,
+          paid_at TEXT,
           customer_name TEXT NOT NULL,
           customer_email TEXT NOT NULL,
           delivery_mode TEXT NOT NULL,
@@ -184,6 +209,16 @@ def init_db() -> None:
         cur.execute("ALTER TABLE orders ADD COLUMN assigned_runner_token TEXT")
     if "assigned_runner_role" not in order_columns:
         cur.execute("ALTER TABLE orders ADD COLUMN assigned_runner_role TEXT")
+    if "pickup_code" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN pickup_code TEXT")
+    if "ready_for_collection_at" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN ready_for_collection_at TEXT")
+    if "payment_status" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'captured'")
+    if "payment_reference" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN payment_reference TEXT")
+    if "paid_at" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN paid_at TEXT")
     if "version" not in order_columns:
         cur.execute("ALTER TABLE orders ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
     if "checkout_type" not in order_columns:
@@ -196,6 +231,7 @@ def read_order_row(cur: sqlite3.Cursor, order_id: int) -> sqlite3.Row:
     cur.execute(
         """
         SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
+               pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
                customer_name, customer_email, delivery_mode, delivery_target,
                items_json, version, checkout_type, status, eta_text, created_at, updated_at
         FROM orders
@@ -210,13 +246,15 @@ def read_order_row(cur: sqlite3.Cursor, order_id: int) -> sqlite3.Row:
 
 
 def read_active_customer_order_row(cur: sqlite3.Cursor, *, venue_slug: str, customer_id: int) -> sqlite3.Row | None:
+    status_placeholders = ", ".join("?" for _ in ACTIVE_CUSTOMER_ORDER_STATUSES)
     cur.execute(
-        """
+        f"""
         SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
+               pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
                customer_name, customer_email, delivery_mode, delivery_target,
                items_json, version, checkout_type, status, eta_text, created_at, updated_at
         FROM orders
-        WHERE venue_slug = ? AND customer_id = ? AND status IN (?, ?, ?, ?, ?, ?, ?)
+        WHERE venue_slug = ? AND customer_id = ? AND status IN ({status_placeholders})
         ORDER BY id DESC
         LIMIT 1
         """,
@@ -226,13 +264,15 @@ def read_active_customer_order_row(cur: sqlite3.Cursor, *, venue_slug: str, cust
 
 
 def read_active_runner_order_row(cur: sqlite3.Cursor, *, venue_slug: str, runner_token: str) -> sqlite3.Row | None:
+    status_placeholders = ", ".join("?" for _ in ACTIVE_RUNNER_ORDER_STATUSES)
     cur.execute(
-        """
+        f"""
         SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
+               pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
                customer_name, customer_email, delivery_mode, delivery_target,
                items_json, version, checkout_type, status, eta_text, created_at, updated_at
         FROM orders
-        WHERE venue_slug = ? AND assigned_runner_token = ? AND status IN (?, ?, ?, ?)
+        WHERE venue_slug = ? AND assigned_runner_token = ? AND status IN ({status_placeholders})
         ORDER BY id DESC
         LIMIT 1
         """,
@@ -248,6 +288,11 @@ def serialize_order_row(row: sqlite3.Row) -> dict[str, object]:
         "customer_id": row["customer_id"],
         "assigned_runner_token": row["assigned_runner_token"],
         "assigned_runner_role": row["assigned_runner_role"],
+        "pickup_code": row["pickup_code"],
+        "ready_for_collection_at": row["ready_for_collection_at"],
+        "payment_status": row["payment_status"],
+        "payment_reference": row["payment_reference"],
+        "paid_at": row["paid_at"],
         "customer_name": row["customer_name"],
         "customer_email": row["customer_email"],
         "delivery_mode": row["delivery_mode"],
@@ -260,6 +305,15 @@ def serialize_order_row(row: sqlite3.Row) -> dict[str, object]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+
+def is_click_and_collect_mode(delivery_mode: str) -> bool:
+    return delivery_mode.strip().lower() == "click & collect"
+
+
+def make_pickup_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(4))
 
 
 def transition_order_status(
@@ -287,6 +341,16 @@ def transition_order_status(
 
     assigned_runner_token = row["assigned_runner_token"]
     assigned_runner_role = row["assigned_runner_role"]
+    pickup_code = row["pickup_code"]
+    ready_for_collection_at = row["ready_for_collection_at"]
+    collect_order = is_click_and_collect_mode(str(row["delivery_mode"]))
+
+    if collect_order and target_status in {"assigned", "loaded", "en_route", "arrived", "fulfilled"}:
+        raise HTTPException(status_code=409, detail="Click and collect orders do not enter runner delivery flow.")
+
+    if not collect_order and target_status in {"ready_for_collection", "collected", "uncollected"}:
+        raise HTTPException(status_code=409, detail="Delivery orders do not enter collection flow.")
+
     if actor_role == "runner":
         if target_status == "assigned":
             if assigned_runner_token and assigned_runner_token != actor_token:
@@ -305,14 +369,26 @@ def transition_order_status(
                 raise HTTPException(status_code=403, detail="Order is assigned to a different runner.")
 
     now = datetime.now(timezone.utc).isoformat()
+    if target_status == "ready_for_collection":
+        pickup_code = pickup_code or make_pickup_code()
+        ready_for_collection_at = now
     cur.execute(
         """
         UPDATE orders
         SET status = ?, updated_at = ?, version = COALESCE(version, 1) + 1,
-            assigned_runner_token = ?, assigned_runner_role = ?
+            assigned_runner_token = ?, assigned_runner_role = ?,
+            pickup_code = ?, ready_for_collection_at = ?
         WHERE id = ?
         """,
-        (target_status, now, assigned_runner_token, assigned_runner_role, order_id),
+        (
+            target_status,
+            now,
+            assigned_runner_token,
+            assigned_runner_role,
+            pickup_code,
+            ready_for_collection_at,
+            order_id,
+        ),
     )
     cur.execute("SELECT version FROM orders WHERE id = ?", (order_id,))
     version_row = cur.fetchone()
@@ -497,7 +573,8 @@ def staff_auth(payload: StaffAuthRequest) -> dict[str, str]:
 
 
 @app.post("/api/register")
-def register_user(payload: RegisterRequest) -> dict[str, int | str]:
+async def register_user(request: Request) -> dict[str, int | str]:
+    payload = await parse_request_model(request, RegisterRequest)
     now = datetime.now(timezone.utc).isoformat()
     conn = get_conn()
     cur = conn.cursor()
@@ -546,12 +623,20 @@ def save_customer_profile(payload: CustomerProfileRequest) -> dict[str, object]:
 
 
 @app.post("/api/orders")
-def create_order(payload: CreateOrderRequest) -> dict[str, object]:
+async def create_order(request: Request) -> dict[str, object]:
+    payload = await parse_request_model(request, CreateOrderRequest)
     if not payload.items:
         raise HTTPException(status_code=400, detail="Order must contain at least one item.")
 
     now = datetime.now(timezone.utc).isoformat()
-    eta_text = "12-18 min" if payload.delivery_mode.lower().startswith("seat") else "8-12 min"
+    payment_status: PaymentStatus = "captured"
+    payment_reference = "prototype_checkout"
+    normalized_delivery_mode = payload.delivery_mode.strip()
+    eta_text = (
+        "Ready in 5-10 min"
+        if is_click_and_collect_mode(normalized_delivery_mode)
+        else "12-18 min" if normalized_delivery_mode.lower().startswith("seat") else "8-12 min"
+    )
     conn = get_conn()
     cur = conn.cursor()
     customer_id: int | None = None
@@ -589,16 +674,20 @@ def create_order(payload: CreateOrderRequest) -> dict[str, object]:
     cur.execute(
         """
         INSERT INTO orders (
-          venue_slug, customer_id, customer_name, customer_email, delivery_mode, delivery_target,
+          venue_slug, customer_id, payment_status, payment_reference, paid_at,
+          customer_name, customer_email, delivery_mode, delivery_target,
           items_json, checkout_type, status, eta_text, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload.venue_slug.strip(),
             customer_id,
+            payment_status,
+            payment_reference,
+            now,
             payload.customer_name.strip(),
             payload.customer_email.strip().lower(),
-            payload.delivery_mode.strip(),
+            normalized_delivery_mode,
             payload.delivery_target.strip(),
             json.dumps([item.model_dump() for item in payload.items]),
             payload.checkout_type,
@@ -616,6 +705,9 @@ def create_order(payload: CreateOrderRequest) -> dict[str, object]:
         "status": "received",
         "eta_text": eta_text,
         "checkout_type": payload.checkout_type,
+        "payment_status": payment_status,
+        "payment_reference": payment_reference,
+        "paid_at": now,
         "version": 1,
     }
     if customer_profile is not None:
@@ -682,6 +774,7 @@ def list_orders(
         cur.execute(
             """
             SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
+                   pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
                    customer_name, delivery_mode, delivery_target,
                    version, checkout_type, status, eta_text, created_at, updated_at
             FROM orders
@@ -695,6 +788,7 @@ def list_orders(
         cur.execute(
             """
             SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
+                   pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
                    customer_name, delivery_mode, delivery_target,
                    version, checkout_type, status, eta_text, created_at, updated_at
             FROM orders
@@ -708,6 +802,7 @@ def list_orders(
         cur.execute(
             """
             SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
+                   pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
                    customer_name, delivery_mode, delivery_target,
                    version, checkout_type, status, eta_text, created_at, updated_at
             FROM orders
@@ -721,6 +816,7 @@ def list_orders(
         cur.execute(
             """
             SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
+                   pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
                    customer_name, delivery_mode, delivery_target,
                    version, checkout_type, status, eta_text, created_at, updated_at
             FROM orders
@@ -739,6 +835,11 @@ def list_orders(
                 "customer_id": row["customer_id"],
                 "assigned_runner_token": row["assigned_runner_token"],
                 "assigned_runner_role": row["assigned_runner_role"],
+                "pickup_code": row["pickup_code"],
+                "ready_for_collection_at": row["ready_for_collection_at"],
+                "payment_status": row["payment_status"],
+                "payment_reference": row["payment_reference"],
+                "paid_at": row["paid_at"],
                 "customer_name": row["customer_name"],
                 "delivery_mode": row["delivery_mode"],
                 "delivery_target": row["delivery_target"],
@@ -766,6 +867,11 @@ def order_status(order_id: int) -> dict:
         "customer_id": row["customer_id"],
         "assigned_runner_token": row["assigned_runner_token"],
         "assigned_runner_role": row["assigned_runner_role"],
+        "pickup_code": row["pickup_code"],
+        "ready_for_collection_at": row["ready_for_collection_at"],
+        "payment_status": row["payment_status"],
+        "payment_reference": row["payment_reference"],
+        "paid_at": row["paid_at"],
         "customer_name": row["customer_name"],
         "customer_email": row["customer_email"],
         "delivery_mode": row["delivery_mode"],
@@ -819,7 +925,49 @@ def ready_order(
     cur = conn.cursor()
     row = read_order_row(cur, order_id)
     require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"venue", "admin"})
-    result = transition_order_status(cur, order_id, "ready", actor_role="venue")
+    target_status: OrderStatus = "ready_for_collection" if is_click_and_collect_mode(str(row["delivery_mode"])) else "ready"
+    result = transition_order_status(cur, order_id, target_status, actor_role="venue")
+    conn.commit()
+    conn.close()
+    return result
+
+
+@app.post("/api/orders/{order_id}/collect")
+def collect_order(
+    order_id: int,
+    payload: CollectVerificationRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, int | str]:
+    conn = get_conn()
+    cur = conn.cursor()
+    row = read_order_row(cur, order_id)
+    require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"venue", "admin"})
+    if not is_click_and_collect_mode(str(row["delivery_mode"])):
+        conn.close()
+        raise HTTPException(status_code=409, detail="Only click and collect orders can be marked collected.")
+    expected_code = str(row["pickup_code"] or "").strip().upper()
+    if not expected_code or expected_code != payload.pickup_code.strip().upper():
+        conn.close()
+        raise HTTPException(status_code=400, detail="Pickup code did not match.")
+    result = transition_order_status(cur, order_id, "collected", actor_role="venue")
+    conn.commit()
+    conn.close()
+    return result
+
+
+@app.post("/api/orders/{order_id}/uncollected")
+def mark_order_uncollected(
+    order_id: int,
+    authorization: str | None = Header(default=None),
+) -> dict[str, int | str]:
+    conn = get_conn()
+    cur = conn.cursor()
+    row = read_order_row(cur, order_id)
+    require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"venue", "admin"})
+    if not is_click_and_collect_mode(str(row["delivery_mode"])):
+        conn.close()
+        raise HTTPException(status_code=409, detail="Only click and collect orders can be marked uncollected.")
+    result = transition_order_status(cur, order_id, "uncollected", actor_role="venue")
     conn.commit()
     conn.close()
     return result
