@@ -4,6 +4,8 @@ const app = document.getElementById("app");
 const STAFF_SESSION_KEY = "drinq_staff_session";
 const REORDER_ROUND_KEY_PREFIX = "drinq_reorder_round_";
 const CUSTOMER_PROFILE_KEY_PREFIX = "drinq_customer_profile_";
+const ACTIVE_ORDER_KEY_PREFIX = "drinq_active_order_";
+const PAGE_POLL_INTERVAL_MS = 5000;
 // DEV ONLY: local staff PIN flow is enabled for prototype testing.
 // Replace with proper auth before production.
 
@@ -13,6 +15,8 @@ const ROLE_PERMISSIONS = {
   venue: { runner: false, venue: true },
   admin: { runner: true, venue: true }
 };
+let pagePollHandle = null;
+let pagePollInFlight = false;
 
 function getVenueSlug() {
   const querySlug = new URLSearchParams(window.location.search).get("venue");
@@ -111,6 +115,10 @@ function customerProfileKey(venueSlug) {
   return `${CUSTOMER_PROFILE_KEY_PREFIX}${venueSlug}`;
 }
 
+function activeOrderKey(venueSlug) {
+  return `${ACTIVE_ORDER_KEY_PREFIX}${venueSlug}`;
+}
+
 function readCart(venueSlug) {
   try {
     const raw = localStorage.getItem(cartKey(venueSlug));
@@ -179,6 +187,41 @@ function clearCustomerProfile(venueSlug) {
   localStorage.removeItem(customerProfileKey(venueSlug));
 }
 
+function readActiveOrderId(venueSlug) {
+  const raw = localStorage.getItem(activeOrderKey(venueSlug));
+  const orderId = Number(raw || 0);
+  return orderId > 0 ? orderId : null;
+}
+
+function writeActiveOrderId(venueSlug, orderId) {
+  localStorage.setItem(activeOrderKey(venueSlug), String(orderId));
+}
+
+function clearActiveOrderId(venueSlug) {
+  localStorage.removeItem(activeOrderKey(venueSlug));
+}
+
+function stopPagePoll() {
+  if (pagePollHandle) {
+    window.clearInterval(pagePollHandle);
+    pagePollHandle = null;
+  }
+  pagePollInFlight = false;
+}
+
+function startPagePoll(callback, intervalMs = PAGE_POLL_INTERVAL_MS) {
+  stopPagePoll();
+  pagePollHandle = window.setInterval(async () => {
+    if (pagePollInFlight) return;
+    pagePollInFlight = true;
+    try {
+      await callback();
+    } finally {
+      pagePollInFlight = false;
+    }
+  }, intervalMs);
+}
+
 async function hydrateCustomerProfile(apiBase, venueSlug) {
   const localProfile = readCustomerProfile(venueSlug);
   if (!localProfile?.token) return localProfile;
@@ -215,6 +258,239 @@ async function hydrateCustomerProfile(apiBase, venueSlug) {
   } catch {
     return localProfile;
   }
+}
+
+async function fetchOrderStatus(apiBase, orderId) {
+  const response = await fetch(`${apiBase}/api/order-status/${orderId}?t=${Date.now()}`, {
+    cache: "no-store"
+  });
+  if (!response.ok) {
+    throw new Error(`Not found (${response.status})`);
+  }
+  return response.json();
+}
+
+function isActiveCustomerOrderStatus(status) {
+  return ["received", "accepted", "ready", "assigned", "loaded", "en_route", "arrived"].includes(
+    String(status || "").toLowerCase()
+  );
+}
+
+async function resolveActiveCustomerOrder(apiBase, venueSlug) {
+  const savedProfile = readCustomerProfile(venueSlug);
+  if (savedProfile?.token) {
+    try {
+      const response = await fetch(
+        `${apiBase}/api/customers/active-order?venue_slug=${encodeURIComponent(venueSlug)}`,
+        {
+          headers: { "X-Customer-Token": savedProfile.token },
+          cache: "no-store"
+        }
+      );
+      if (response.ok) {
+        const data = await response.json();
+        if (data.active_order?.order_id) {
+          writeActiveOrderId(venueSlug, data.active_order.order_id);
+          return data.active_order;
+        }
+      }
+    } catch {
+      // Fall back to locally remembered active order id if profile lookup is temporarily unavailable.
+    }
+  }
+
+  const activeOrderId = readActiveOrderId(venueSlug);
+  if (!activeOrderId) return null;
+
+  try {
+    const order = await fetchOrderStatus(apiBase, activeOrderId);
+    if (isActiveCustomerOrderStatus(order.status)) {
+      return order;
+    }
+    clearActiveOrderId(venueSlug);
+    return null;
+  } catch {
+    clearActiveOrderId(venueSlug);
+    return null;
+  }
+}
+
+async function fetchRunnerActiveOrder(apiBase, venueSlug, authHeader) {
+  const response = await fetch(
+    `${apiBase}/api/runners/active-order?venue_slug=${encodeURIComponent(venueSlug)}`,
+    {
+      headers: { Authorization: authHeader },
+      cache: "no-store"
+    }
+  );
+  if (!response.ok) {
+    throw new Error(`Could not fetch runner state (${response.status})`);
+  }
+  const data = await response.json();
+  return data.active_order || null;
+}
+
+function bindOrderStatusActionButtons({ venueSlug, orderData, role, apiBase }) {
+  document.getElementById("refreshStatusBtn")?.addEventListener("click", () => {
+    renderOrderStatus(venueSlug, orderData.order_id, apiBase, role);
+  });
+  document.getElementById("backToMenuBtn")?.addEventListener("click", () => setRoute("/"));
+  document.getElementById("tipRunnerBtn")?.addEventListener("click", () => {
+    alert("Thanks. Tip flow placeholder for prototype.");
+  });
+  document.getElementById("reorderBtn")?.addEventListener("click", () => {
+    const reordered = (orderData.items || []).map((item) => ({
+      item_id: item.item_id,
+      item_name: item.item_name,
+      price_text: item.price_text,
+      price_pennies: parsePriceToPennies(item.price_text),
+      quantity: Number(item.quantity) || 1
+    }));
+    clearCart(venueSlug);
+    writeReorderRound(venueSlug, reordered);
+    setRoute("/");
+  });
+}
+
+function updateOrderStatusDom({ venueSlug, orderData, role, apiBase }) {
+  if (isActiveCustomerOrderStatus(orderData.status)) {
+    writeActiveOrderId(venueSlug, orderData.order_id);
+  } else {
+    clearActiveOrderId(venueSlug);
+  }
+
+  const status = String(orderData.status || "").toLowerCase();
+  const isCustomerView = role === "customer";
+  const isFulfilled = status === "fulfilled";
+  const isTerminal = ["fulfilled", "rejected", "cancelled", "failed"].includes(status);
+  const brandChip = document.getElementById("orderStatusChip");
+  const title = document.getElementById("orderStatusTitle");
+  const heroCopy = document.getElementById("orderStatusHeroCopy");
+  const completion = document.getElementById("orderCompletion");
+  const delivery = document.getElementById("orderDelivery");
+  const items = document.getElementById("orderItems");
+  const actions = document.getElementById("orderActions");
+
+  if (!brandChip || !title || !heroCopy || !completion || !delivery || !items || !actions) {
+    return;
+  }
+
+  brandChip.textContent = isCustomerView && isFulfilled ? "ORDER COMPLETE" : "ORDER STATUS";
+  title.textContent = `Order #${orderData.order_id}`;
+  heroCopy.innerHTML = isCustomerView && isFulfilled
+    ? "It's been delivered!"
+    : `Status: <strong>${escapeHtml(orderData.status)}</strong> · ETA: ${escapeHtml(orderData.eta_text)}`;
+
+  if (isCustomerView && isFulfilled) {
+    completion.innerHTML = `
+      <section class="form-card completion-card">
+        <h2>It's been delivered!</h2>
+        <p>Your order is complete.</p>
+        <button class="inline-btn" id="tipRunnerBtn">Tip Runner</button>
+        <button class="inline-btn ghost" id="reorderBtn">Order Again</button>
+      </section>
+    `;
+  } else if (isTerminal) {
+    completion.innerHTML = isCustomerView
+      ? `
+        <section class="form-card completion-card">
+          <h2>${isFulfilled ? "Order Complete" : "Order Closed"}</h2>
+          <p>${isFulfilled ? "Delivered successfully." : `This order has now ${escapeHtml(status)}.`}</p>
+          <button class="inline-btn ghost" id="reorderBtn">${isFulfilled ? "Order Again" : "Start New Order"}</button>
+        </section>
+      `
+      : `
+        <section class="form-card">
+          <h2>Order Update</h2>
+          <p>Order status is <strong>${escapeHtml(status)}</strong>.</p>
+        </section>
+      `;
+  } else {
+    completion.innerHTML = "";
+  }
+
+  delivery.innerHTML = `
+    <section class="form-card">
+      <h2>Delivery</h2>
+      <p><strong>Mode:</strong> ${escapeHtml(orderData.delivery_mode)}</p>
+      <p><strong>Target:</strong> ${escapeHtml(orderData.delivery_target)}</p>
+      <p><strong>Customer:</strong> ${escapeHtml(orderData.customer_name)} (${escapeHtml(orderData.customer_email)})</p>
+    </section>
+  `;
+
+  items.innerHTML = `
+    <section class="form-card">
+      <h2>Items</h2>
+      <ul class="summary-list">
+        ${(orderData.items || [])
+          .map((item) => `<li>${escapeHtml(item.item_name)} x${item.quantity}<span>${escapeHtml(item.price_text)}</span></li>`)
+          .join("")}
+      </ul>
+    </section>
+  `;
+
+  actions.innerHTML = `
+    <section class="form-card">
+      <button class="inline-btn" id="refreshStatusBtn">Refresh Status</button>
+      <button class="inline-btn ghost" id="backToMenuBtn">Back To Menu</button>
+    </section>
+  `;
+
+  bindOrderStatusActionButtons({ venueSlug, orderData, role, apiBase });
+}
+
+function renderRunnerOrdersDom(container, { activeOrder, orders }) {
+  if (activeOrder) {
+    container.innerHTML = `
+      <article class="form-card">
+        <h2>Active Order #${activeOrder.order_id} · ${escapeHtml(activeOrder.status)}</h2>
+        <p><strong>Customer:</strong> ${escapeHtml(activeOrder.customer_name)}</p>
+        <p><strong>Mode:</strong> ${escapeHtml(activeOrder.delivery_mode)} · <strong>ETA:</strong> ${escapeHtml(activeOrder.eta_text)}</p>
+        <p><strong>Target:</strong> ${escapeHtml(activeOrder.delivery_target)}</p>
+        <p class="api-note">Runner is locked to this order until it reaches a terminal state.</p>
+        ${runnerActiveStatusButtons(activeOrder.order_id)}
+      </article>
+    `;
+    return;
+  }
+
+  if (!orders || orders.length === 0) {
+    container.innerHTML = `<section class="form-card"><p>No runner-ready orders available.</p></section>`;
+    return;
+  }
+
+  container.innerHTML = orders
+    .map(
+      (order) => `
+      <article class="form-card">
+        <h2>Order #${order.order_id} · ${escapeHtml(order.status)}</h2>
+        <p><strong>Customer:</strong> ${escapeHtml(order.customer_name)}</p>
+        <p><strong>Mode:</strong> ${escapeHtml(order.delivery_mode)} · <strong>ETA:</strong> ${escapeHtml(order.eta_text)}</p>
+        <p><strong>Target:</strong> ${escapeHtml(order.delivery_target)}</p>
+        ${runnerQueueButtons(order.order_id)}
+      </article>
+    `
+    )
+    .join("");
+}
+
+function bindRunnerStatusButtons(container, { venueSlug, apiBase, authHeader }) {
+  const statusButtons = container.querySelectorAll(".status-btn");
+  statusButtons.forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const orderId = btn.getAttribute("data-order-id");
+      const status = btn.getAttribute("data-status");
+      if (!orderId || !status) return;
+      btn.disabled = true;
+      try {
+        await postOrderStatus(apiBase, orderId, status, authHeader);
+        renderRunnerDashboard(venueSlug, apiBase, authHeader);
+      } catch (error) {
+        alert(`Could not update status: ${error.message}`);
+        btn.disabled = false;
+      }
+    });
+  });
 }
 
 function itemCount(items) {
@@ -310,8 +586,15 @@ function addItemToCart(venueSlug, menuItem) {
   writeCart(venueSlug, cart);
 }
 
-function renderVenueMenu(venueSlug, venue, role, apiBase) {
+async function renderVenueMenu(venueSlug, venue, role, apiBase) {
   const permissions = ROLE_PERMISSIONS[role] ?? ROLE_PERMISSIONS.customer;
+  if (role === "customer") {
+    const activeOrder = await resolveActiveCustomerOrder(apiBase, venueSlug);
+    if (activeOrder?.order_id) {
+      setRoute(`/order-status/${activeOrder.order_id}`);
+      return;
+    }
+  }
   const runnerAuth = getAuthHeader(venueSlug, "runner");
   const venueAuth = getAuthHeader(venueSlug, "venue");
   const canRunner = permissions.runner && Boolean(runnerAuth);
@@ -616,6 +899,7 @@ async function renderCheckout(venueSlug, venue, apiBase) {
           checkoutType
         });
       }
+      writeActiveOrderId(venueSlug, orderData.order_id);
       clearCart(venueSlug);
       setRoute(`/order-status/${orderData.order_id}`);
     } catch (error) {
@@ -626,153 +910,38 @@ async function renderCheckout(venueSlug, venue, apiBase) {
 }
 
 async function renderOrderStatus(venueSlug, orderId, apiBase, role) {
+  stopPagePoll();
   app.innerHTML = `
     <section class="hero">
-      <span class="brand-chip">ORDER STATUS</span>
-      <h1 class="venue-title">Order #${orderId}</h1>
-      <p class="venue-copy">Fetching latest status...</p>
+      <span class="brand-chip" id="orderStatusChip">ORDER STATUS</span>
+      <h1 class="venue-title" id="orderStatusTitle">Order #${orderId}</h1>
+      <p class="venue-copy" id="orderStatusHeroCopy">Fetching latest status...</p>
     </section>
+    <section id="orderCompletion"></section>
+    <section id="orderDelivery"></section>
+    <section id="orderItems"></section>
+    <section id="orderActions"></section>
   `;
 
   try {
-    const res = await fetch(`${apiBase}/api/order-status/${orderId}?t=${Date.now()}`, {
-      cache: "no-store"
-    });
-    if (!res.ok) {
-      throw new Error(`Not found (${res.status})`);
-    }
-    const data = await res.json();
-    const status = String(data.status || "").toLowerCase();
-    const isCustomerView = role === "customer";
-    const isFulfilled = status === "fulfilled";
-    const isTerminal = ["fulfilled", "rejected", "cancelled", "failed"].includes(status);
-    if (isCustomerView && isFulfilled) {
-      app.innerHTML = `
-        <section class="hero">
-          <span class="brand-chip">ORDER COMPLETE</span>
-          <h1 class="venue-title">Order #${data.order_id}</h1>
-          <p class="venue-copy">It's been delivered!</p>
-        </section>
-
-        <section class="form-card completion-card">
-          <h2>It's been delivered!</h2>
-          <p>Your order is complete.</p>
-          <button class="inline-btn" id="tipRunnerBtn">Tip Runner</button>
-          <button class="inline-btn ghost" id="reorderBtn">Order Again</button>
-        </section>
-
-        <section class="form-card">
-          <h2>Delivery</h2>
-          <p><strong>Mode:</strong> ${escapeHtml(data.delivery_mode)}</p>
-          <p><strong>Target:</strong> ${escapeHtml(data.delivery_target)}</p>
-          <p><strong>Customer:</strong> ${escapeHtml(data.customer_name)} (${escapeHtml(data.customer_email)})</p>
-        </section>
-
-        <section class="form-card">
-          <h2>Items</h2>
-          <ul class="summary-list">
-            ${data.items
-              .map((item) => `<li>${escapeHtml(item.item_name)} x${item.quantity}<span>${escapeHtml(item.price_text)}</span></li>`)
-              .join("")}
-          </ul>
-        </section>
-      `;
-
-      document.getElementById("tipRunnerBtn")?.addEventListener("click", () => {
-        alert("Thanks. Tip flow placeholder for prototype.");
-      });
-      document.getElementById("reorderBtn")?.addEventListener("click", () => {
-        const reordered = (data.items || []).map((item) => ({
-          item_id: item.item_id,
-          item_name: item.item_name,
-          price_text: item.price_text,
-          price_pennies: parsePriceToPennies(item.price_text),
-          quantity: Number(item.quantity) || 1
-        }));
-        clearCart(venueSlug);
-        writeReorderRound(venueSlug, reordered);
-        setRoute("/");
-      });
-      return;
-    }
-
-    const completionBlock = isTerminal
-      ? isCustomerView
-        ? `
-      <section class="form-card completion-card">
-        <h2>${isFulfilled ? "Order Complete" : "Order Closed"}</h2>
-        <p>${
-          isFulfilled
-            ? "Delivered successfully."
-            : `This order has now ${escapeHtml(status)}.`
-        }</p>
-        ${
-          isFulfilled
-            ? `<button class="inline-btn" id="tipRunnerBtn">Tip Runner</button>
-               <button class="inline-btn ghost" id="reorderBtn">Order Again</button>`
-            : `<button class="inline-btn ghost" id="reorderBtn">Start New Order</button>
-               `
+    const data = await fetchOrderStatus(apiBase, orderId);
+    updateOrderStatusDom({ venueSlug, orderData: data, role, apiBase });
+    if (isActiveCustomerOrderStatus(data.status)) {
+      startPagePoll(async () => {
+        const latest = await fetchOrderStatus(apiBase, orderId);
+        if (String(latest.version || "") !== String(data.version || "") || latest.status !== data.status) {
+          updateOrderStatusDom({ venueSlug, orderData: latest, role, apiBase });
+          data.version = latest.version;
+          data.status = latest.status;
+          data.eta_text = latest.eta_text;
+          data.items = latest.items;
+          data.delivery_mode = latest.delivery_mode;
+          data.delivery_target = latest.delivery_target;
+          data.customer_name = latest.customer_name;
+          data.customer_email = latest.customer_email;
         }
-      </section>
-      `
-        : `
-      <section class="form-card">
-        <h2>Order Update</h2>
-        <p>Order status is <strong>${escapeHtml(status)}</strong>.</p>
-      </section>
-      `
-      : "";
-
-    app.innerHTML = `
-      <section class="hero">
-        <span class="brand-chip">ORDER STATUS</span>
-        <h1 class="venue-title">Order #${data.order_id}</h1>
-        <p class="venue-copy">Status: <strong>${escapeHtml(data.status)}</strong> · ETA: ${escapeHtml(data.eta_text)}</p>
-      </section>
-
-      ${completionBlock}
-
-      <section class="form-card">
-        <h2>Delivery</h2>
-        <p><strong>Mode:</strong> ${escapeHtml(data.delivery_mode)}</p>
-        <p><strong>Target:</strong> ${escapeHtml(data.delivery_target)}</p>
-        <p><strong>Customer:</strong> ${escapeHtml(data.customer_name)} (${escapeHtml(data.customer_email)})</p>
-      </section>
-
-      <section class="form-card">
-        <h2>Items</h2>
-        <ul class="summary-list">
-          ${data.items
-            .map((item) => `<li>${escapeHtml(item.item_name)} x${item.quantity}<span>${escapeHtml(item.price_text)}</span></li>`)
-            .join("")}
-        </ul>
-      </section>
-
-      <section class="form-card">
-        <button class="inline-btn" id="refreshStatusBtn">Refresh Status</button>
-        <button class="inline-btn ghost" id="backToMenuBtn">Back To Menu</button>
-      </section>
-    `;
-
-    document.getElementById("refreshStatusBtn")?.addEventListener("click", () => {
-      renderOrderStatus(venueSlug, orderId, apiBase, role);
-    });
-    document.getElementById("backToMenuBtn")?.addEventListener("click", () => setRoute("/"));
-    document.getElementById("tipRunnerBtn")?.addEventListener("click", () => {
-      alert("Thanks. Tip flow placeholder for prototype.");
-    });
-    document.getElementById("reorderBtn")?.addEventListener("click", () => {
-      const reordered = (data.items || []).map((item) => ({
-        item_id: item.item_id,
-        item_name: item.item_name,
-        price_text: item.price_text,
-        price_pennies: parsePriceToPennies(item.price_text),
-        quantity: Number(item.quantity) || 1
-      }));
-      clearCart(venueSlug);
-      writeReorderRound(venueSlug, reordered);
-      setRoute("/");
-    });
+      });
+    }
   } catch (error) {
     app.innerHTML = `
       <section class="unknown">
@@ -788,6 +957,26 @@ function runnerStatusButtons(orderId) {
   return `
     <div class="runner-actions">
       <button class="inline-btn status-btn" data-order-id="${orderId}" data-status="assigned">Assign</button>
+      <button class="inline-btn status-btn" data-order-id="${orderId}" data-status="loaded">Loaded</button>
+      <button class="inline-btn status-btn" data-order-id="${orderId}" data-status="en_route">En Route</button>
+      <button class="inline-btn status-btn" data-order-id="${orderId}" data-status="arrived">Arrived</button>
+      <button class="inline-btn status-btn" data-order-id="${orderId}" data-status="fulfilled">Fulfilled</button>
+      <button class="inline-btn ghost status-btn" data-order-id="${orderId}" data-status="cancelled">Cancel</button>
+    </div>
+  `;
+}
+
+function runnerQueueButtons(orderId) {
+  return `
+    <div class="runner-actions">
+      <button class="inline-btn status-btn" data-order-id="${orderId}" data-status="assigned">Assign</button>
+    </div>
+  `;
+}
+
+function runnerActiveStatusButtons(orderId) {
+  return `
+    <div class="runner-actions">
       <button class="inline-btn status-btn" data-order-id="${orderId}" data-status="loaded">Loaded</button>
       <button class="inline-btn status-btn" data-order-id="${orderId}" data-status="en_route">En Route</button>
       <button class="inline-btn status-btn" data-order-id="${orderId}" data-status="arrived">Arrived</button>
@@ -822,6 +1011,7 @@ async function postOrderStatus(apiBase, orderId, status, authHeader) {
 }
 
 async function renderRunnerDashboard(venueSlug, apiBase, authHeader) {
+  stopPagePoll();
   app.innerHTML = `
     <section class="hero">
       <span class="brand-chip">RUNNER DASHBOARD</span>
@@ -842,49 +1032,47 @@ async function renderRunnerDashboard(venueSlug, apiBase, authHeader) {
   container.innerHTML = `<section class="form-card"><p>Loading orders...</p></section>`;
 
   try {
-    const res = await fetch(`${apiBase}/api/orders?venue_slug=${encodeURIComponent(venueSlug)}&limit=50`, {
-      headers: { Authorization: authHeader }
-    });
-    if (!res.ok) {
-      throw new Error(`Could not fetch orders (${res.status})`);
-    }
-    const data = await res.json();
-    const orders = data.orders || [];
+    const loadRunnerDashboardState = async () => {
+      const activeOrder = await fetchRunnerActiveOrder(apiBase, venueSlug, authHeader);
+      if (activeOrder) {
+        return { activeOrder, orders: [] };
+      }
 
-    if (orders.length === 0) {
-      container.innerHTML = `<section class="form-card"><p>No orders yet for ${escapeHtml(venueSlug)}.</p></section>`;
-      return;
-    }
-
-    container.innerHTML = orders
-      .map(
-        (order) => `
-        <article class="form-card">
-          <h2>Order #${order.order_id} · ${escapeHtml(order.status)}</h2>
-          <p><strong>Customer:</strong> ${escapeHtml(order.customer_name)}</p>
-          <p><strong>Mode:</strong> ${escapeHtml(order.delivery_mode)} · <strong>ETA:</strong> ${escapeHtml(order.eta_text)}</p>
-          <p><strong>Target:</strong> ${escapeHtml(order.delivery_target)}</p>
-          ${runnerStatusButtons(order.order_id)}
-        </article>
-      `
-      )
-      .join("");
-
-    const statusButtons = document.querySelectorAll(".status-btn");
-    statusButtons.forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const orderId = btn.getAttribute("data-order-id");
-        const status = btn.getAttribute("data-status");
-        if (!orderId || !status) return;
-        btn.disabled = true;
-        try {
-          await postOrderStatus(apiBase, orderId, status, authHeader);
-          renderRunnerDashboard(venueSlug, apiBase, authHeader);
-        } catch (error) {
-          alert(`Could not update status: ${error.message}`);
-          btn.disabled = false;
-        }
+      const res = await fetch(`${apiBase}/api/orders?venue_slug=${encodeURIComponent(venueSlug)}&limit=50`, {
+        headers: { Authorization: authHeader },
+        cache: "no-store"
       });
+      if (!res.ok) {
+        throw new Error(`Could not fetch orders (${res.status})`);
+      }
+      const data = await res.json();
+      const orders = (data.orders || []).filter((order) =>
+        ["ready", "assigned"].includes(String(order.status || "").toLowerCase())
+      );
+      return { activeOrder: null, orders };
+    };
+
+    const state = await loadRunnerDashboardState();
+    let signature = JSON.stringify({
+      activeOrderId: state.activeOrder?.order_id || null,
+      activeOrderVersion: state.activeOrder?.version || null,
+      orders: state.orders.map((order) => [order.order_id, order.version, order.status, order.assigned_runner_token || ""])
+    });
+    renderRunnerOrdersDom(container, state);
+    bindRunnerStatusButtons(container, { venueSlug, apiBase, authHeader });
+
+    startPagePoll(async () => {
+      const nextState = await loadRunnerDashboardState();
+      const nextSignature = JSON.stringify({
+        activeOrderId: nextState.activeOrder?.order_id || null,
+        activeOrderVersion: nextState.activeOrder?.version || null,
+        orders: nextState.orders.map((order) => [order.order_id, order.version, order.status, order.assigned_runner_token || ""])
+      });
+      if (nextSignature !== signature) {
+        signature = nextSignature;
+        renderRunnerOrdersDom(container, nextState);
+        bindRunnerStatusButtons(container, { venueSlug, apiBase, authHeader });
+      }
     });
   } catch (error) {
     container.innerHTML = `<section class="unknown">Runner dashboard error: ${escapeHtml(error.message)}</section>`;
@@ -892,6 +1080,7 @@ async function renderRunnerDashboard(venueSlug, apiBase, authHeader) {
 }
 
 async function renderVenueDashboard(venueSlug, apiBase, authHeader) {
+  stopPagePoll();
   app.innerHTML = `
     <section class="hero">
       <span class="brand-chip">VENUE OPS</span>
@@ -960,12 +1149,14 @@ async function renderVenueDashboard(venueSlug, apiBase, authHeader) {
         }
       });
     });
+    startPagePoll(() => renderVenueDashboard(venueSlug, apiBase, authHeader));
   } catch (error) {
     container.innerHTML = `<section class="unknown">Venue dashboard error: ${escapeHtml(error.message)}</section>`;
   }
 }
 
 async function render() {
+  stopPagePoll();
   const venueSlug = getVenueSlug();
   const apiBase = getApiBase();
   const role = getRole();
@@ -1033,7 +1224,7 @@ async function render() {
     return;
   }
 
-  renderVenueMenu(venueSlug, venue, role, apiBase);
+  await renderVenueMenu(venueSlug, venue, role, apiBase);
 }
 
 window.addEventListener("hashchange", () => {
