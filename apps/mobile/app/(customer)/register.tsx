@@ -1,9 +1,26 @@
 import { useState } from "react";
-import { Pressable, SafeAreaView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Alert, Pressable, SafeAreaView, StyleSheet, Text, TextInput, View } from "react-native";
+import { joinMailingList } from "../../lib/drinq";
 
 export default function CustomerRegister() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    if (!name.trim() || !email.trim() || busy) return;
+    setBusy(true);
+    try {
+      await joinMailingList({ name: name.trim(), email: email.trim() });
+      setName("");
+      setEmail("");
+      Alert.alert("Registered", "You have been added to the mailing list for this venue.");
+    } catch (error) {
+      Alert.alert("Registration error", (error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -25,8 +42,8 @@ export default function CustomerRegister() {
           autoCapitalize="none"
           keyboardType="email-address"
         />
-        <Pressable style={styles.button}>
-          <Text style={styles.buttonText}>Register</Text>
+        <Pressable style={[styles.button, busy ? styles.buttonDisabled : null]} disabled={busy} onPress={submit}>
+          <Text style={styles.buttonText}>{busy ? "Submitting..." : "Register"}</Text>
         </Pressable>
       </View>
     </SafeAreaView>
@@ -53,5 +70,6 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     alignItems: "center"
   },
+  buttonDisabled: { opacity: 0.5 },
   buttonText: { color: "#FFFFFF", fontWeight: "700" }
 });

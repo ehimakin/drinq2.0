@@ -6,14 +6,11 @@ export default function HomeScreen() {
     <SafeAreaView style={styles.safe}>
       <View style={styles.container}>
         <Text style={styles.badge}>DRINQ</Text>
-        <Text style={styles.title}>Don't Queue.</Text>
+        <Text style={styles.title}>Ops Companion</Text>
         <Text style={styles.subtitle}>
-          Universal app shell is live. Choose an area to continue.
+          Customers order through the web app. This Expo app is for optional venue and runner operations while parity is built out.
         </Text>
         <View style={styles.links}>
-          <Link href="/(customer)" style={styles.link}>
-            Customer
-          </Link>
           <Link href="/(runner)" style={styles.link}>
             Runner
           </Link>
@@ -24,6 +21,9 @@ export default function HomeScreen() {
             Admin
           </Link>
         </View>
+        <Text style={styles.note}>
+          Customer ordering, checkout, live tracking, and tipping are web-first in `apps/web`.
+        </Text>
       </View>
     </SafeAreaView>
   );
@@ -54,6 +54,14 @@ const styles = StyleSheet.create({
     marginBottom: 24
   },
   links: { width: "100%", gap: 10, maxWidth: 360 },
+  note: {
+    marginTop: 18,
+    color: "#8F98A3",
+    fontSize: 13,
+    textAlign: "center",
+    maxWidth: 420,
+    lineHeight: 20
+  },
   link: {
     color: "#111111",
     backgroundColor: "#FFFFFF",

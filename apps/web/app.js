@@ -6,15 +6,22 @@ const REORDER_ROUND_KEY_PREFIX = "drinq_reorder_round_";
 const CUSTOMER_PROFILE_KEY_PREFIX = "drinq_customer_profile_";
 const ACTIVE_ORDER_KEY_PREFIX = "drinq_active_order_";
 const DELIVERY_MODE_PREF_KEY_PREFIX = "drinq_delivery_mode_";
+const PENDING_TIP_KEY_PREFIX = "drinq_pending_tip_";
+const MENU_CATEGORY_FILTER_KEY_PREFIX = "drinq_menu_category_filter_";
 const PAGE_POLL_INTERVAL_MS = 5000;
+const TIP_OPTIONS_PENNIES = [100, 200, 300, 500];
 // DEV ONLY: local staff PIN flow is enabled for prototype testing.
 // Replace with proper auth before production.
 
 const ROLE_PERMISSIONS = {
-  customer: { runner: false, venue: false },
-  runner: { runner: true, venue: false },
-  venue: { runner: false, venue: true },
-  admin: { runner: true, venue: true }
+  customer: { runner: false, venue: false, vendor: false },
+  runner: { runner: true, venue: false, vendor: false },
+  vendor: { runner: false, venue: false, vendor: true },
+  venue: { runner: false, venue: true, vendor: false },
+  admin: { runner: true, venue: true, vendor: true }
+};
+const VENDOR_ROLE_BINDINGS = {
+  "brentford-fc": "50pints"
 };
 let pagePollHandle = null;
 let pagePollInFlight = false;
@@ -51,7 +58,10 @@ function getRoute() {
   const orderMatch = hash.match(/^#\/order-status\/(\d+)$/i);
   if (orderMatch) return { name: "order-status", orderId: Number(orderMatch[1]) };
   if (hash === "#/checkout") return { name: "checkout" };
+  if (hash === "#/runner-stream") return { name: "runner-stream" };
   if (hash === "#/runner") return { name: "runner" };
+  if (hash === "#/stream") return { name: "stream" };
+  if (hash === "#/vendor") return { name: "vendor" };
   if (hash === "#/venue") return { name: "venue" };
 
   return { name: "menu" };
@@ -78,6 +88,45 @@ function clearStaffSession() {
   localStorage.removeItem(STAFF_SESSION_KEY);
 }
 
+function handleStaffLogout() {
+  clearStaffSession();
+  if (getRoute().name === "menu") {
+    render();
+    return;
+  }
+  setRoute("/");
+}
+
+function makeHttpError(message, status) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function isStaffSessionError(error) {
+  return Boolean(error && typeof error === "object" && (error.status === 401 || error.status === 403));
+}
+
+function getVendorSlugForRole(venueSlug, role) {
+  if (role !== "vendor") return "";
+  return VENDOR_ROLE_BINDINGS[venueSlug] || "";
+}
+
+function getVendorDisplayName(venueSlug) {
+  const session = getStaffSession();
+  if (session?.venue_slug === venueSlug && session?.vendor_name) {
+    return String(session.vendor_name);
+  }
+  const vendorSlug = VENDOR_ROLE_BINDINGS[venueSlug] || "";
+  if (vendorSlug === "50pints") return "50Pints";
+  if (!vendorSlug) return "Vendor";
+  return vendorSlug
+    .split("-")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
 function getAuthHeader(venueSlug, requestedRole) {
   const session = getStaffSession();
   if (!session) return null;
@@ -86,16 +135,35 @@ function getAuthHeader(venueSlug, requestedRole) {
   return `Bearer ${session.token}`;
 }
 
+function sessionMatchesRole(session, venueSlug, role) {
+  if (!session) return false;
+  if (session.venue_slug !== venueSlug) return false;
+  if (role === "customer") return false;
+  return session.role === role || session.role === "admin";
+}
+
+function renderStaffSessionButton(venueSlug, role, permissions, variant = "ghost") {
+  if (!(permissions.runner || permissions.venue || permissions.vendor)) return "";
+  const session = getStaffSession();
+  const buttonClass = variant === "solid" ? "inline-btn" : "inline-btn ghost";
+  const isLoggedInForRole = sessionMatchesRole(session, venueSlug, role);
+  return isLoggedInForRole
+    ? `<button class="${buttonClass}" id="staffLogoutBtn">Logout</button>`
+    : `<button class="${buttonClass}" id="staffLoginBtn">Staff Login</button>`;
+}
+
 async function loginStaff(apiBase, venueSlug, role) {
   const pin = window.prompt(`Enter staff PIN for ${venueSlug} (${role})`);
   if (!pin) return false;
+  const vendorSlug = getVendorSlugForRole(venueSlug, role);
   const response = await fetch(`${apiBase}/api/staff/auth`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       venue_slug: venueSlug,
       pin: pin.trim(),
-      role
+      role,
+      vendor_slug: vendorSlug || null
     })
   });
   if (!response.ok) {
@@ -124,6 +192,10 @@ function activeOrderKey(venueSlug) {
 
 function deliveryModePreferenceKey(venueSlug) {
   return `${DELIVERY_MODE_PREF_KEY_PREFIX}${venueSlug}`;
+}
+
+function pendingTipKey(venueSlug) {
+  return `${PENDING_TIP_KEY_PREFIX}${venueSlug}`;
 }
 
 function readCart(venueSlug) {
@@ -172,14 +244,23 @@ function readCustomerProfile(venueSlug) {
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
+    const preferredDeliveryMode = String(parsed.preferredDeliveryMode || "");
+    const preferredDeliveryTarget = String(parsed.preferredDeliveryTarget || "");
+    const lastDeliveryMode = String(parsed.lastDeliveryMode || parsed.deliveryMode || "");
+    const lastDeliveryTarget = String(parsed.lastDeliveryTarget || parsed.deliveryTarget || "");
     return {
       customerId: Number(parsed.customerId || 0) || null,
       token: String(parsed.token || ""),
       name: String(parsed.name || ""),
       email: String(parsed.email || ""),
-      deliveryMode: String(parsed.deliveryMode || ""),
-      deliveryTarget: String(parsed.deliveryTarget || ""),
-      checkoutType: String(parsed.checkoutType || "remembered")
+      deliveryMode: String(parsed.deliveryMode || preferredDeliveryMode || lastDeliveryMode),
+      deliveryTarget: String(parsed.deliveryTarget || preferredDeliveryTarget || lastDeliveryTarget),
+      preferredDeliveryMode,
+      preferredDeliveryTarget,
+      lastDeliveryMode,
+      lastDeliveryTarget,
+      checkoutType: String(parsed.checkoutType || "remembered"),
+      accountLevel: String(parsed.accountLevel || "profile")
     };
   } catch {
     return null;
@@ -209,15 +290,50 @@ function clearActiveOrderId(venueSlug) {
 }
 
 function readPreferredDeliveryMode(venueSlug) {
-  const raw = localStorage.getItem(deliveryModePreferenceKey(venueSlug));
-  if (raw) return String(raw);
+  const sessionValue = sessionStorage.getItem(deliveryModePreferenceKey(venueSlug));
+  if (sessionValue) return String(sessionValue);
   const savedProfile = readCustomerProfile(venueSlug);
-  if (savedProfile?.deliveryMode) return savedProfile.deliveryMode;
+  if (savedProfile?.preferredDeliveryMode) return savedProfile.preferredDeliveryMode;
+  if (savedProfile?.lastDeliveryMode) return savedProfile.lastDeliveryMode;
+  const legacyValue = localStorage.getItem(deliveryModePreferenceKey(venueSlug));
+  if (legacyValue) return String(legacyValue);
   return "";
 }
 
 function writePreferredDeliveryMode(venueSlug, deliveryMode) {
-  localStorage.setItem(deliveryModePreferenceKey(venueSlug), deliveryMode);
+  sessionStorage.setItem(deliveryModePreferenceKey(venueSlug), deliveryMode);
+  localStorage.removeItem(deliveryModePreferenceKey(venueSlug));
+}
+
+function readPendingTipAmount(venueSlug) {
+  const raw = sessionStorage.getItem(pendingTipKey(venueSlug));
+  const amount = Number(raw || 0);
+  return amount > 0 ? amount : 0;
+}
+
+function writePendingTipAmount(venueSlug, tipAmountPennies) {
+  const normalized = Math.max(0, Number(tipAmountPennies || 0));
+  if (normalized === 0) {
+    sessionStorage.removeItem(pendingTipKey(venueSlug));
+    return;
+  }
+  sessionStorage.setItem(pendingTipKey(venueSlug), String(normalized));
+}
+
+function clearPendingTipAmount(venueSlug) {
+  sessionStorage.removeItem(pendingTipKey(venueSlug));
+}
+
+function menuCategoryFilterKey(venueSlug) {
+  return `${MENU_CATEGORY_FILTER_KEY_PREFIX}${venueSlug}`;
+}
+
+function readMenuCategoryFilter(venueSlug) {
+  return sessionStorage.getItem(menuCategoryFilterKey(venueSlug)) || "All";
+}
+
+function writeMenuCategoryFilter(venueSlug, category) {
+  sessionStorage.setItem(menuCategoryFilterKey(venueSlug), String(category || "All"));
 }
 
 function stopPagePoll() {
@@ -270,13 +386,32 @@ async function hydrateCustomerProfile(apiBase, venueSlug) {
       email: String(remoteProfile.email || ""),
       deliveryMode: String(remoteProfile.delivery_mode || ""),
       deliveryTarget: String(remoteProfile.delivery_target || ""),
-      checkoutType: "remembered"
+      preferredDeliveryMode: String(remoteProfile.preferred_delivery_mode || ""),
+      preferredDeliveryTarget: String(remoteProfile.preferred_delivery_target || ""),
+      lastDeliveryMode: String(remoteProfile.last_delivery_mode || remoteProfile.delivery_mode || ""),
+      lastDeliveryTarget: String(remoteProfile.last_delivery_target || remoteProfile.delivery_target || ""),
+      checkoutType: "remembered",
+      accountLevel: String(remoteProfile.account_level || "profile")
     };
     writeCustomerProfile(venueSlug, mergedProfile);
     return mergedProfile;
   } catch {
     return localProfile;
   }
+}
+
+async function lookupCustomerAccount(apiBase, venueSlug, email) {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (!normalizedEmail || !normalizedEmail.includes("@")) return null;
+
+  const response = await fetch(
+    `${apiBase}/api/customers/lookup?venue_slug=${encodeURIComponent(venueSlug)}&email=${encodeURIComponent(normalizedEmail)}`,
+    { cache: "no-store" }
+  );
+  if (!response.ok) {
+    throw new Error(`Customer lookup failed (${response.status})`);
+  }
+  return response.json();
 }
 
 async function fetchOrderStatus(apiBase, orderId) {
@@ -367,6 +502,85 @@ function describePaymentStatus(paymentStatus) {
   return { label: "Payment Pending", copy: "Payment is still being processed." };
 }
 
+function shouldOfferTipForOrder(orderData, role) {
+  if (role !== "customer") return false;
+  if (!orderData || Boolean(orderData.has_tip)) return false;
+  const status = String(orderData.status || "").toLowerCase();
+  return !["rejected", "cancelled", "failed", "uncollected"].includes(status);
+}
+
+function closeTipModal() {
+  document.getElementById("tipModal")?.remove();
+}
+
+function openTipModal({
+  title,
+  subtitle,
+  initialAmountPennies = 0,
+  confirmLabel = "Save Tip",
+  allowClear = false,
+  onConfirm
+}) {
+  closeTipModal();
+  const initialSelected = TIP_OPTIONS_PENNIES.includes(initialAmountPennies) ? initialAmountPennies : TIP_OPTIONS_PENNIES[1];
+  document.body.insertAdjacentHTML(
+    "beforeend",
+    `
+      <div class="tip-modal-backdrop" id="tipModal">
+        <div class="tip-modal" role="dialog" aria-modal="true" aria-labelledby="tipModalTitle">
+          <h2 id="tipModalTitle">${escapeHtml(title)}</h2>
+          <p class="tip-modal-copy">${escapeHtml(subtitle)}</p>
+          <div class="tip-options" id="tipOptions">
+            ${TIP_OPTIONS_PENNIES.map((amount) => `
+              <button class="tip-option-btn${amount === initialSelected ? " is-selected" : ""}" type="button" data-tip-option="${amount}">
+                ${escapeHtml(formatPennies(amount))}
+              </button>
+            `).join("")}
+          </div>
+          <div class="tip-modal-actions">
+            ${allowClear ? `<button class="inline-btn ghost" type="button" id="clearTipBtn">No Tip</button>` : ""}
+            <button class="inline-btn ghost" type="button" id="cancelTipBtn">Cancel</button>
+            <button class="inline-btn" type="button" id="confirmTipBtn">${escapeHtml(confirmLabel)}</button>
+          </div>
+        </div>
+      </div>
+    `
+  );
+  let selectedAmount = initialSelected;
+  document.querySelectorAll("[data-tip-option]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const nextAmount = Number(button.getAttribute("data-tip-option") || 0);
+      if (!nextAmount) return;
+      selectedAmount = nextAmount;
+      document.querySelectorAll("[data-tip-option]").forEach((other) => other.classList.remove("is-selected"));
+      button.classList.add("is-selected");
+    });
+  });
+  document.getElementById("cancelTipBtn")?.addEventListener("click", closeTipModal);
+  document.getElementById("clearTipBtn")?.addEventListener("click", async () => {
+    await onConfirm(0);
+    closeTipModal();
+  });
+  document.getElementById("confirmTipBtn")?.addEventListener("click", async () => {
+    await onConfirm(selectedAmount);
+    closeTipModal();
+  });
+  document.getElementById("tipModal")?.addEventListener("click", (event) => {
+    if (event.target?.id === "tipModal") closeTipModal();
+  });
+}
+
+async function submitTipForOrder(apiBase, orderId, tipAmountPennies) {
+  const response = await fetch(`${apiBase}/api/orders/${orderId}/tip`, {
+    method: "POST",
+    body: JSON.stringify({ tip_amount_pennies: tipAmountPennies })
+  });
+  if (!response.ok) {
+    throw new Error(`Tip failed (${response.status})`);
+  }
+  return response.json();
+}
+
 function describeCustomerOrderState(orderData) {
   const status = String(orderData.status || "").toLowerCase();
   const collectOrder = isClickAndCollectOrder(orderData);
@@ -426,8 +640,18 @@ function bindOrderStatusActionButtons({ venueSlug, orderData, role, apiBase }) {
     renderOrderStatus(venueSlug, orderData.order_id, apiBase, role);
   });
   document.getElementById("backToMenuBtn")?.addEventListener("click", () => setRoute("/"));
-  document.getElementById("tipRunnerBtn")?.addEventListener("click", () => {
-    alert("Thanks. Tip flow placeholder for prototype.");
+  document.querySelectorAll("[data-tip-action='open']").forEach((button) => {
+    button.addEventListener("click", () => {
+      openTipModal({
+        title: "Add Tip",
+        subtitle: "Add a tip to this order.",
+        confirmLabel: "Add Tip",
+        onConfirm: async (tipAmountPennies) => {
+          await submitTipForOrder(apiBase, orderData.order_id, tipAmountPennies);
+          await renderOrderStatus(venueSlug, orderData.order_id, apiBase, role);
+        }
+      });
+    });
   });
   document.getElementById("reorderBtn")?.addEventListener("click", () => {
     const reordered = (orderData.items || []).map((item) => ({
@@ -459,6 +683,10 @@ function updateOrderStatusDom({ venueSlug, orderData, role, apiBase }) {
   const isTerminal = ["fulfilled", "collected", "uncollected", "rejected", "cancelled", "failed"].includes(status);
   const payment = describePaymentStatus(orderData.payment_status);
   const customerState = describeCustomerOrderState(orderData);
+  const canTip = shouldOfferTipForOrder(orderData, role);
+  const showCompletionTipButton = canTip && (isFulfilled || isCollected);
+  const showActionTipButton = canTip && !showCompletionTipButton;
+  const finalTotal = formatPennies(orderItemsTotalPennies(orderData.items) + Number(orderData.tip_amount_pennies || 0));
   const brandChip = document.getElementById("orderStatusChip");
   const title = document.getElementById("orderStatusTitle");
   const heroCopy = document.getElementById("orderStatusHeroCopy");
@@ -473,10 +701,12 @@ function updateOrderStatusDom({ venueSlug, orderData, role, apiBase }) {
   }
 
   brandChip.textContent = isCustomerView ? customerState.chip : "ORDER STATUS";
-  title.textContent = `Order #${orderData.order_id}`;
+  title.textContent = getOrderTitle(orderData);
   heroCopy.innerHTML = isCustomerView
-    ? `${escapeHtml(customerState.copy)}<br /><span class="api-note"><strong>${escapeHtml(payment.label)}</strong> · ${escapeHtml(orderData.eta_text)}</span>`
-    : `Status: <strong>${escapeHtml(orderData.status)}</strong> · ETA: ${escapeHtml(orderData.eta_text)}`;
+    ? `${escapeHtml(customerState.copy)}<br /><span class="api-note"><strong>${escapeHtml(payment.label)}</strong> · ${escapeHtml(orderData.eta_text)} · ${escapeHtml(
+        getOrderReference(orderData)
+      )}</span>`
+    : `Status: <strong>${escapeHtml(orderData.status)}</strong> · ETA: ${escapeHtml(orderData.eta_text)} · ${escapeHtml(getOrderReference(orderData))}`;
   statusSummary.innerHTML = `
     <section class="form-card order-status-spotlight">
       <p class="order-status-spotlight-label">${escapeHtml(isCustomerView ? customerState.chip : "ORDER STATUS")}</p>
@@ -485,6 +715,12 @@ function updateOrderStatusDom({ venueSlug, orderData, role, apiBase }) {
         <strong>${escapeHtml(payment.label)}</strong>
         <span aria-hidden="true">•</span>
         <span>${escapeHtml(orderData.eta_text)}</span>
+        ${
+          orderData.has_tip
+            ? `<span aria-hidden="true">•</span><span>Tip added ${escapeHtml(formatPennies(orderData.tip_amount_pennies || 0))}</span>`
+            : ""
+        }
+        <span aria-hidden="true">•</span><span>Final total ${escapeHtml(finalTotal)}</span>
       </p>
     </section>
   `;
@@ -494,7 +730,7 @@ function updateOrderStatusDom({ venueSlug, orderData, role, apiBase }) {
       <section class="form-card completion-card">
         <h2>${isCollected ? "Order Collected" : "It's been delivered!"}</h2>
         <p>${isCollected ? "Your click and collect order has been handed over." : "Your order is complete."}</p>
-        ${isCollected ? "" : `<button class="inline-btn" id="tipRunnerBtn">Tip Runner</button>`}
+        ${showCompletionTipButton ? `<button class="inline-btn" data-tip-action="open">Tip Order</button>` : ""}
         <button class="inline-btn ghost" id="reorderBtn">Order Again</button>
       </section>
     `;
@@ -533,6 +769,8 @@ function updateOrderStatusDom({ venueSlug, orderData, role, apiBase }) {
       <p><strong>Mode:</strong> ${escapeHtml(orderData.delivery_mode)}</p>
       <p><strong>Target:</strong> ${escapeHtml(orderData.delivery_target)}</p>
       <p><strong>Payment:</strong> ${escapeHtml(payment.label)}</p>
+      <p><strong>Tip:</strong> ${orderData.has_tip ? escapeHtml(formatPennies(orderData.tip_amount_pennies || 0)) : "Not added"}</p>
+      <p><strong>Final Total:</strong> ${escapeHtml(finalTotal)}</p>
       ${
         orderData.paid_at
           ? `<p><strong>Paid At:</strong> ${escapeHtml(new Date(orderData.paid_at).toLocaleString())}</p>`
@@ -555,6 +793,7 @@ function updateOrderStatusDom({ venueSlug, orderData, role, apiBase }) {
 
   actions.innerHTML = `
     <section class="form-card">
+      ${showActionTipButton ? `<button class="inline-btn" data-tip-action="open">Tip Order</button>` : ""}
       <button class="inline-btn" id="refreshStatusBtn">Refresh Status</button>
       <button class="inline-btn ghost" id="backToMenuBtn">Back To Menu</button>
     </section>
@@ -567,7 +806,8 @@ function renderRunnerOrdersDom(container, { activeOrder, orders }) {
   if (activeOrder) {
     container.innerHTML = `
       <article class="form-card">
-        <h2>Active Order #${activeOrder.order_id} · ${escapeHtml(activeOrder.status)}</h2>
+        <h2>${escapeHtml(getOrderTitle(activeOrder))} · ${escapeHtml(activeOrder.status)}</h2>
+        <p class="api-note">${escapeHtml(getOrderReference(activeOrder))}</p>
         <p><strong>Customer:</strong> ${escapeHtml(activeOrder.customer_name)}</p>
         <p><strong>Mode:</strong> ${escapeHtml(activeOrder.delivery_mode)} · <strong>ETA:</strong> ${escapeHtml(activeOrder.eta_text)}</p>
         <p><strong>Target:</strong> ${escapeHtml(activeOrder.delivery_target)}</p>
@@ -587,7 +827,8 @@ function renderRunnerOrdersDom(container, { activeOrder, orders }) {
     .map(
       (order) => `
       <article class="form-card">
-        <h2>Order #${order.order_id} · ${escapeHtml(order.status)}</h2>
+        <h2>${escapeHtml(getOrderTitle(order))} · ${escapeHtml(order.status)}</h2>
+        <p class="api-note">${escapeHtml(getOrderReference(order))}</p>
         <p><strong>Customer:</strong> ${escapeHtml(order.customer_name)}</p>
         <p><strong>Mode:</strong> ${escapeHtml(order.delivery_mode)} · <strong>ETA:</strong> ${escapeHtml(order.eta_text)}</p>
         <p><strong>Target:</strong> ${escapeHtml(order.delivery_target)}</p>
@@ -601,14 +842,15 @@ function renderRunnerOrdersDom(container, { activeOrder, orders }) {
 function bindRunnerStatusButtons(container, { venueSlug, apiBase, authHeader }) {
   const statusButtons = container.querySelectorAll(".status-btn");
   statusButtons.forEach((btn) => {
-    btn.addEventListener("click", async () => {
+    btn.addEventListener("click", async (event) => {
+      event.preventDefault();
       const orderId = btn.getAttribute("data-order-id");
       const status = btn.getAttribute("data-status");
       if (!orderId || !status) return;
       btn.disabled = true;
       try {
         await postOrderStatus(apiBase, orderId, status, authHeader);
-        renderRunnerDashboard(venueSlug, apiBase, authHeader);
+        renderRunnerStream(venueSlug, apiBase, authHeader);
       } catch (error) {
         alert(`Could not update status: ${error.message}`);
         btn.disabled = false;
@@ -617,7 +859,29 @@ function bindRunnerStatusButtons(container, { venueSlug, apiBase, authHeader }) 
   });
 }
 
-function renderVenueOrdersDom(container, orders, venueSlug) {
+function renderOrderItemsSummary(items) {
+  const safeItems = Array.isArray(items) ? items : [];
+  if (safeItems.length === 0) {
+    return `<p class="api-note">Items unavailable for this order.</p>`;
+  }
+  return `
+    <div class="order-items-summary">
+      <p><strong>Items:</strong></p>
+      <ul class="summary-list">
+        ${safeItems
+          .map(
+            (item) =>
+              `<li>${escapeHtml(item.item_name || "Unknown item")} x${escapeHtml(String(item.quantity || 0))}<span>${escapeHtml(
+                item.price_text || ""
+              )}</span></li>`
+          )
+          .join("")}
+      </ul>
+    </div>
+  `;
+}
+
+function renderVenueOrdersDom(container, orders, venueSlug, isAdmin = false) {
   if (!orders || orders.length === 0) {
     container.innerHTML = `<section class="form-card"><p>No orders yet for ${escapeHtml(venueSlug)}.</p></section>`;
     return;
@@ -627,17 +891,22 @@ function renderVenueOrdersDom(container, orders, venueSlug) {
     .map(
       (order) => `
       <article class="form-card">
-        <h2>Order #${order.order_id} · ${escapeHtml(order.status)}</h2>
+        <h2>${escapeHtml(getOrderTitle(order))} · ${escapeHtml(order.status)}</h2>
+        <p class="api-note">${escapeHtml(getOrderReference(order))}</p>
+        ${renderOrderItemsSummary(order.items)}
         <p><strong>Customer:</strong> ${escapeHtml(order.customer_name)}</p>
         <p><strong>Mode:</strong> ${escapeHtml(order.delivery_mode)} · <strong>ETA:</strong> ${escapeHtml(order.eta_text)}</p>
         <p><strong>Target:</strong> ${escapeHtml(order.delivery_target)}</p>
+        <p><strong>Payment:</strong> ${escapeHtml(order.payment_status || "pending")}</p>
+        ${order.failure_reason ? `<p><strong>Failure:</strong> ${escapeHtml(order.failure_reason)}</p>` : ""}
+        ${order.refund_reason ? `<p><strong>Refund:</strong> ${escapeHtml(order.refund_reason)}</p>` : ""}
         ${
           isClickAndCollectOrder(order)
             ? `
               <p><strong>Pickup Code:</strong> ${escapeHtml(order.pickup_code || "Pending")}</p>
-              ${venueCollectButtons(order)}
+              ${venueCollectButtons(order, isAdmin)}
             `
-            : venueStatusButtons(order.order_id, order.status)
+            : venueStatusButtons(order, isAdmin)
         }
       </article>
     `
@@ -667,11 +936,17 @@ function bindVenueActionButtons(container, { venueSlug, apiBase, authHeader }) {
           headers["Content-Type"] = "application/json";
           options.body = JSON.stringify({ pickup_code: enteredCode.trim() });
         }
+        if (action === "fail" || action === "refund") {
+          const reasonPrompt = action === "fail" ? "Reason for order failure?" : "Reason for refund?";
+          const enteredReason = window.prompt(reasonPrompt, "");
+          headers["Content-Type"] = "application/json";
+          options.body = JSON.stringify({ reason: enteredReason?.trim() || null });
+        }
         const update = await fetch(endpoint, options);
         if (!update.ok) {
           throw new Error(`Action failed (${update.status})`);
         }
-        await renderVenueDashboard(venueSlug, apiBase, authHeader);
+        await renderVendorStream(venueSlug, apiBase, authHeader);
       } catch (error) {
         alert(`Could not perform venue action: ${error.message}`);
         btn.disabled = false;
@@ -680,8 +955,216 @@ function bindVenueActionButtons(container, { venueSlug, apiBase, authHeader }) {
   });
 }
 
+function renderAdminMenuManager(container, items) {
+  container.innerHTML = `
+    <section class="form-card">
+      <h2>Menu Admin</h2>
+      <p class="api-note">Edit item names, prices, availability, and fulfilment modes from the web prototype.</p>
+      <button class="inline-btn" id="adminAddMenuItemBtn">Add Menu Item</button>
+      <div class="admin-menu-list">
+        ${items
+          .map(
+            (item) => `
+            <article class="item admin-menu-item">
+              <h3>${escapeHtml(item.item_name)}</h3>
+              <div class="item-meta">
+                <span>${escapeHtml(item.category)}</span>
+                <span class="price">${escapeHtml(item.price_text)}</span>
+              </div>
+              <p class="api-note">${escapeHtml(item.available_modes.join(", "))}</p>
+              <p class="api-note">${item.is_active ? "Active" : "Hidden from customer menu"}</p>
+              <div class="runner-actions">
+                <button class="inline-btn admin-menu-edit-btn" data-menu-item-id="${escapeHtml(item.item_id)}">Edit</button>
+                <button class="inline-btn ghost admin-menu-toggle-btn" data-menu-item-id="${escapeHtml(item.item_id)}" data-next-active="${item.is_active ? "false" : "true"}">
+                  ${item.is_active ? "Hide" : "Enable"}
+                </button>
+                <button class="inline-btn ghost admin-menu-delete-btn" data-menu-item-id="${escapeHtml(item.item_id)}">Delete</button>
+              </div>
+            </article>
+          `
+          )
+          .join("")}
+      </div>
+    </section>
+  `;
+}
+
+function promptForMenuItem(initial = null) {
+  const itemId = initial?.item_id || window.prompt("Item id (slug style, e.g. bf-ipa)", "");
+  if (!itemId || !itemId.trim()) return null;
+  const itemName = window.prompt("Item name", initial?.item_name || "");
+  if (!itemName || !itemName.trim()) return null;
+  const category = window.prompt("Category", initial?.category || "Beer");
+  if (!category || !category.trim()) return null;
+  const priceText = window.prompt("Price text", initial?.price_text || "PS0.00");
+  if (!priceText || !priceText.trim()) return null;
+  const modeValue = window.prompt(
+    "Available modes (comma separated)",
+    (initial?.available_modes || ["Seat Delivery", "Nearest Point", "Click & Collect"]).join(", ")
+  );
+  const availableModes = String(modeValue || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (availableModes.length === 0) return null;
+  return {
+    item_id: itemId.trim(),
+    item_name: itemName.trim(),
+    category: category.trim(),
+    price_text: priceText.trim(),
+    available_modes: availableModes,
+    is_active: initial?.is_active ?? true
+  };
+}
+
+function bindAdminMenuButtons(container, { venueSlug, apiBase, authHeader, getItems, onUpdated }) {
+  document.getElementById("adminAddMenuItemBtn")?.addEventListener("click", async () => {
+    const nextItem = promptForMenuItem();
+    if (!nextItem) return;
+    try {
+      await saveMenuItem(apiBase, authHeader, venueSlug, nextItem, true);
+      await onUpdated();
+    } catch (error) {
+      alert(`Could not create menu item: ${error.message}`);
+    }
+  });
+
+  container.querySelectorAll(".admin-menu-edit-btn").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const itemId = button.getAttribute("data-menu-item-id");
+      const existing = getItems().find((item) => item.item_id === itemId);
+      if (!existing) return;
+      const nextItem = promptForMenuItem(existing);
+      if (!nextItem) return;
+      try {
+        await saveMenuItem(apiBase, authHeader, venueSlug, { ...existing, ...nextItem }, false);
+        await onUpdated();
+      } catch (error) {
+        alert(`Could not update menu item: ${error.message}`);
+      }
+    });
+  });
+
+  container.querySelectorAll(".admin-menu-toggle-btn").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const itemId = button.getAttribute("data-menu-item-id");
+      const nextActive = button.getAttribute("data-next-active") === "true";
+      const existing = getItems().find((item) => item.item_id === itemId);
+      if (!existing) return;
+      try {
+        await saveMenuItem(apiBase, authHeader, venueSlug, { ...existing, is_active: nextActive }, false);
+        await onUpdated();
+      } catch (error) {
+        alert(`Could not update menu availability: ${error.message}`);
+      }
+    });
+  });
+
+  container.querySelectorAll(".admin-menu-delete-btn").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const itemId = button.getAttribute("data-menu-item-id");
+      if (!itemId) return;
+      const confirmed = window.confirm(`Delete menu item "${itemId}"? This removes it from the venue menu.`);
+      if (!confirmed) return;
+      try {
+        await deleteMenuItem(apiBase, authHeader, venueSlug, itemId);
+        await onUpdated();
+      } catch (error) {
+        alert(`Could not delete menu item: ${error.message}`);
+      }
+    });
+  });
+}
+
 function itemCount(items) {
   return items.reduce((sum, item) => sum + item.quantity, 0);
+}
+
+function getDisplayOrderNumber(order) {
+  const raw = Number(order?.display_order_number || order?.order_id || 0);
+  return raw > 0 ? String(raw).padStart(3, "0") : "000";
+}
+
+function getOrderTitle(order) {
+  return `Order ${getDisplayOrderNumber(order)}`;
+}
+
+function getOrderReference(order) {
+  const parts = [];
+  if (order?.business_day) parts.push(order.business_day);
+  if (order?.order_id) parts.push(`Ref #${order.order_id}`);
+  return parts.join(" · ");
+}
+
+function normalizeMenuItem(item) {
+  return {
+    id: item.id || item.item_id,
+    item_id: item.item_id || item.id,
+    name: item.name || item.item_name,
+    item_name: item.item_name || item.name,
+    category: item.category,
+    price: item.price || item.price_text,
+    price_text: item.price_text || item.price,
+    options: item.options || item.available_modes || [],
+    available_modes: item.available_modes || item.options || [],
+    is_active: item.is_active ?? true
+  };
+}
+
+async function fetchMenuItems(apiBase, venueSlug, { includeInactive = false, authHeader = null } = {}) {
+  const headers = {};
+  if (authHeader) headers.Authorization = authHeader;
+  const response = await fetch(
+    `${apiBase}/api/menu?venue_slug=${encodeURIComponent(venueSlug)}${includeInactive ? "&include_inactive=true" : ""}`,
+    {
+      headers,
+      cache: "no-store"
+    }
+  );
+  if (!response.ok) {
+    throw makeHttpError(`Could not fetch menu (${response.status})`, response.status);
+  }
+  const data = await response.json();
+  return (data.items || []).map(normalizeMenuItem);
+}
+
+async function saveMenuItem(apiBase, authHeader, venueSlug, item, isNew = false) {
+  const endpoint = isNew ? `${apiBase}/api/menu/items` : `${apiBase}/api/menu/items/${encodeURIComponent(item.item_id)}`;
+  const response = await fetch(endpoint, {
+    method: isNew ? "POST" : "PUT",
+    headers: {
+      Authorization: authHeader,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      venue_slug: venueSlug,
+      item_id: item.item_id,
+      item_name: item.item_name,
+      category: item.category,
+      price_text: item.price_text,
+      available_modes: item.available_modes,
+      is_active: Boolean(item.is_active)
+    })
+  });
+  if (!response.ok) {
+    throw new Error(`Could not save menu item (${response.status})`);
+  }
+  return normalizeMenuItem(await response.json());
+}
+
+async function deleteMenuItem(apiBase, authHeader, venueSlug, itemId) {
+  const response = await fetch(
+    `${apiBase}/api/menu/items/${encodeURIComponent(itemId)}?venue_slug=${encodeURIComponent(venueSlug)}`,
+    {
+      method: "DELETE",
+      headers: {
+        Authorization: authHeader
+      }
+    }
+  );
+  if (!response.ok) {
+    throw new Error(`Could not delete menu item (${response.status})`);
+  }
 }
 
 function parsePriceToPennies(priceText) {
@@ -696,6 +1179,10 @@ function formatPennies(pennies) {
 
 function totalPennies(items) {
   return items.reduce((sum, item) => sum + item.price_pennies * item.quantity, 0);
+}
+
+function orderItemsTotalPennies(items) {
+  return (items || []).reduce((sum, item) => sum + parsePriceToPennies(item.price_text) * Number(item.quantity || 0), 0);
 }
 
 function escapeHtml(value) {
@@ -728,8 +1215,7 @@ function renderForbidden(role, routeName, venueSlug, apiBase) {
       <br /><br />
       <strong>DEV ONLY:</strong> default PIN for local testing is <code>8888</code>. Remove before production.
       <br /><br />
-      <button class="inline-btn" id="staffLoginBtn">Staff Login</button>
-      <button class="inline-btn ghost" id="staffLogoutBtn">Logout</button>
+      ${renderStaffSessionButton(venueSlug, role, ROLE_PERMISSIONS[role] ?? ROLE_PERMISSIONS.customer, "solid")}
       <button class="inline-btn" id="forbiddenBackBtn">Back To Menu</button>
     </section>
   `;
@@ -744,8 +1230,7 @@ function renderForbidden(role, routeName, venueSlug, apiBase) {
     }
   });
   document.getElementById("staffLogoutBtn")?.addEventListener("click", () => {
-    clearStaffSession();
-    render();
+    handleStaffLogout();
   });
   document.getElementById("forbiddenBackBtn")?.addEventListener("click", () => setRoute("/"));
 }
@@ -760,6 +1245,7 @@ function renderVenueHero(venue, options = {}) {
   const {
     compact = false,
     contextChip = venue.tag,
+    headingTitle = venue.name,
     title = compact ? venue.name : venue.branding?.heroTitle || venue.name,
     copy = compact ? venue.branding?.staffCopy || venue.subtitle : venue.branding?.heroCopy || venue.subtitle,
     toolbarButtons = []
@@ -789,7 +1275,7 @@ function renderVenueHero(venue, options = {}) {
       }
       <div class="venue-hero-toolbar">
         <div class="venue-hero-toolbar-heading">
-          <h1 class="venue-hero-toolbar-title">${escapeHtml(venue.name)}</h1>
+          <h1 class="venue-hero-toolbar-title">${escapeHtml(headingTitle)}</h1>
           <span class="venue-hero-toolbar-verified" aria-label="${escapeHtml(contextChip)}">
             <span class="venue-hero-toolbar-tick" aria-hidden="true">✓</span>
             <span>${escapeHtml(contextChip)}</span>
@@ -835,6 +1321,13 @@ function bindHeroToolbarButtons() {
   });
 }
 
+function getStreamRouteForRole(role, permissions) {
+  if (role === "runner") return "/runner-stream";
+  if (permissions.vendor) return "/stream";
+  if (permissions.runner) return "/runner-stream";
+  return "";
+}
+
 function addItemToCart(venueSlug, menuItem) {
   const cart = readCart(venueSlug);
   const existing = cart.find((x) => x.item_id === menuItem.id);
@@ -852,44 +1345,176 @@ function addItemToCart(venueSlug, menuItem) {
   writeCart(venueSlug, cart);
 }
 
+function bindCartSectionButtons({
+  venueSlug,
+  venue,
+  role,
+  permissions,
+  apiBase,
+  hasLockedOrder = false,
+  activeOrder = null,
+  reorderRound = [],
+  onChanged
+}) {
+  const canVendor = permissions.vendor || role === "admin";
+  const canVenue = permissions.venue || role === "admin";
+  const canRunner = permissions.runner || role === "admin";
+  const rerender = typeof onChanged === "function" ? onChanged : () => renderVenueMenu(venueSlug, venue, role, apiBase);
+
+  const goCheckoutBtn = document.getElementById("goCheckoutBtn");
+  if (goCheckoutBtn) {
+    goCheckoutBtn.addEventListener("click", () => {
+      if (hasLockedOrder && activeOrder?.order_id) {
+        setRoute(`/order-status/${activeOrder.order_id}`);
+        return;
+      }
+      setRoute("/checkout");
+    });
+  }
+
+  const clearCartBtn = document.getElementById("clearCartBtn");
+  if (clearCartBtn) {
+    clearCartBtn.addEventListener("click", () => {
+      if (hasLockedOrder) return;
+      clearCart(venueSlug);
+      rerender();
+    });
+  }
+
+  document.getElementById("reorderRoundBtn")?.addEventListener("click", () => {
+    if (hasLockedOrder) return;
+    writeCart(venueSlug, reorderRound);
+    clearReorderRound(venueSlug);
+    rerender();
+  });
+
+  if (canRunner) {
+    document.getElementById("goRunnerDashboardBtn")?.addEventListener("click", () => setRoute("/runner"));
+  }
+  if (canVendor) {
+    document.getElementById("goVendorOpsBtn")?.addEventListener("click", () => setRoute("/vendor"));
+  }
+  if (canVenue) {
+    document.getElementById("goVenueOpsBtn")?.addEventListener("click", () => setRoute("/venue"));
+  }
+  document.getElementById("staffLoginBtn")?.addEventListener("click", async () => {
+    try {
+      const desiredRole = role === "admin" ? "admin" : permissions.vendor ? "vendor" : permissions.venue ? "venue" : "runner";
+      const ok = await loginStaff(apiBase, venueSlug, desiredRole);
+      if (ok) render();
+    } catch (error) {
+      alert(`Staff login failed: ${error.message}`);
+    }
+  });
+  document.getElementById("staffLogoutBtn")?.addEventListener("click", () => {
+    handleStaffLogout();
+  });
+}
+
 async function renderVenueMenu(venueSlug, venue, role, apiBase) {
   const permissions = ROLE_PERMISSIONS[role] ?? ROLE_PERMISSIONS.customer;
+  const isCustomerRole = role === "customer";
+  const isVendorRole = role === "vendor";
+  const isVenueRole = role === "venue";
   const activeOrder = role === "customer" ? await resolveActiveCustomerOrder(apiBase, venueSlug) : null;
+  let menuItems = venue.menuItems.map(normalizeMenuItem);
+  try {
+    menuItems = await fetchMenuItems(apiBase, venueSlug);
+  } catch {
+    // Fall back to static venue data if the menu API is temporarily unavailable.
+  }
   const hasLockedOrder = Boolean(activeOrder?.order_id);
-  const toolbarButtons = [
-    { label: "Menu", action: "route", target: "/", active: true },
-    { label: "Deals", action: "scroll", target: "#modesSection" },
-    {
-      label: "Tracker",
-      action: activeOrder?.order_id ? "route" : "scroll",
-      target: activeOrder?.order_id ? `/order-status/${activeOrder.order_id}` : "#cartSection"
-    }
-  ];
   const runnerAuth = getAuthHeader(venueSlug, "runner");
+  const vendorAuth = getAuthHeader(venueSlug, "vendor");
   const venueAuth = getAuthHeader(venueSlug, "venue");
   const canRunner = permissions.runner && Boolean(runnerAuth);
+  const canVendor = permissions.vendor && Boolean(vendorAuth);
   const canVenue = permissions.venue && Boolean(venueAuth);
+  const streamRoute = getStreamRouteForRole(role, permissions);
+  const vendorDisplayName = isVendorRole ? getVendorDisplayName(venueSlug) : "";
+  const toolbarButtons = [{ label: "Menu", action: "route", target: "/", active: true }];
+  if (streamRoute) {
+    toolbarButtons.push({ label: "Stream", action: "route", target: streamRoute });
+  }
   const cart = readCart(venueSlug);
   const reorderRound = readReorderRound(venueSlug);
   const count = itemCount(cart);
   const total = formatPennies(totalPennies(cart));
   const preferredDeliveryMode =
     readPreferredDeliveryMode(venueSlug) || venue.fulfillmentModes[0]?.label || "";
+  const categoryOptions = ["All", ...new Set(menuItems.map((item) => String(item.category || "").trim()).filter(Boolean))];
+  const selectedCategory = categoryOptions.includes(readMenuCategoryFilter(venueSlug))
+    ? readMenuCategoryFilter(venueSlug)
+    : "All";
+  const visibleMenuItems =
+    selectedCategory === "All" ? menuItems : menuItems.filter((item) => String(item.category || "").trim() === selectedCategory);
+
+  if (isVenueRole) {
+    app.innerHTML = `
+      ${renderVenueHero(venue, { toolbarButtons: [{ label: "Venue", action: "route", target: "/", active: true }] })}
+      <section class="form-card">
+        <h2>Venue Role</h2>
+        <p>This role does not use the shared customer/vendor menu surface.</p>
+        <p class="api-note">Use venue-level operations for parent venue management, or vendor surfaces for seller menus and live order handling.</p>
+      </section>
+      <section class="cart-mini" id="cartSection">
+        ${canVenue ? `<button class="inline-btn ghost" id="goVenueOpsBtn">Venue Ops</button>` : ""}
+        ${renderStaffSessionButton(venueSlug, role, permissions)}
+      </section>
+    `;
+    bindHeroToolbarButtons();
+    if (canVenue) {
+      document.getElementById("goVenueOpsBtn")?.addEventListener("click", () => setRoute("/venue"));
+    }
+    document.getElementById("staffLoginBtn")?.addEventListener("click", async () => {
+      try {
+        const ok = await loginStaff(apiBase, venueSlug, role === "admin" ? "admin" : "venue");
+        if (ok) render();
+      } catch (error) {
+        alert(`Staff login failed: ${error.message}`);
+      }
+    });
+    document.getElementById("staffLogoutBtn")?.addEventListener("click", () => {
+      handleStaffLogout();
+    });
+    return;
+  }
 
   app.innerHTML = `
-    ${renderVenueHero(venue, { toolbarButtons })}
+    ${renderVenueHero(venue, { toolbarButtons, headingTitle: isVendorRole ? vendorDisplayName : venue.name })}
     ${
       hasLockedOrder
         ? `
       <div class="active-order-banner">
         <strong>Active order in progress</strong><br />
-        You can browse the menu, but ordering is locked until Order #${escapeHtml(activeOrder.order_id)} is complete.
+        You can browse the menu, but ordering is locked until ${escapeHtml(getOrderTitle(activeOrder))} is complete.
         <br /><br />
         <button class="inline-btn" id="resumeActiveOrderBtn">Resume Active Order</button>
       </div>
     `
         : ""
     }
+    <section class="category-slug-shell">
+      <div class="category-slug" id="categorySlug">
+        <div class="category-slug-track">
+          ${categoryOptions
+            .map(
+              (category) => `
+            <button
+              class="category-chip${selectedCategory === category ? " is-active" : ""}"
+              type="button"
+              data-menu-category="${escapeHtml(category)}"
+            >
+              ${escapeHtml(category)}
+            </button>`
+            )
+            .join("")}
+        </div>
+      </div>
+    </section>
+    ${
+      isCustomerRole
+        ? `
     <div class="modes" id="modesSection">
       ${venue.fulfillmentModes
         .map(
@@ -901,8 +1526,11 @@ async function renderVenueMenu(venueSlug, venue, role, apiBase) {
         )
         .join("")}
     </div>
+    `
+        : ""
+    }
     <section class="menu-grid">
-      ${venue.menuItems
+      ${visibleMenuItems
         .map(
           (item) => `
         <article class="item" data-item-id="${item.id}">
@@ -914,15 +1542,40 @@ async function renderVenueMenu(venueSlug, venue, role, apiBase) {
 	          <ul class="option-list">
 	            ${item.options.map((opt) => `<li>${modeLine(opt, venue)}</li>`).join("")}
 	          </ul>
-	          <button class="add-btn" data-add-id="${item.id}" ${hasLockedOrder ? "disabled" : ""}>
+	          ${
+              isCustomerRole
+                ? `<button class="add-btn" data-add-id="${item.id}" ${hasLockedOrder ? "disabled" : ""}>
               ${hasLockedOrder ? "Ordering Locked" : "Add To Cart"}
-            </button>
+            </button>`
+                : canVendor && isVendorRole
+                  ? `
+              <div class="runner-actions">
+                <button class="inline-btn ghost vendor-menu-edit-btn" data-menu-item-id="${escapeHtml(item.item_id)}">Edit</button>
+                <button class="inline-btn ghost vendor-menu-delete-btn" data-menu-item-id="${escapeHtml(item.item_id)}">Delete</button>
+              </div>
+            `
+                  : `<div class="api-note">Vendor login required to edit or delete menu items.</div>`
+            }
 	        </article>`
 	        )
 	        .join("")}
+      ${
+        canVendor && isVendorRole
+          ? `
+        <article class="item add-item-card" id="vendorAddItemCard" role="button" tabindex="0" aria-label="Add menu item">
+          <div class="add-item-plus" aria-hidden="true">+</div>
+          <h3>Add Menu Item</h3>
+          <p class="api-note">Create a new item in this vendor menu.</p>
+        </article>
+      `
+          : ""
+      }
     </section>
 
     <section class="cart-mini" id="cartSection">
+      ${
+        isCustomerRole
+          ? `
       Cart: <strong>${count} item${count === 1 ? "" : "s"}</strong> · ${total}
       ${
         reorderRound.length > 0
@@ -932,93 +1585,136 @@ async function renderVenueMenu(venueSlug, venue, role, apiBase) {
       <button class="inline-btn" id="goCheckoutBtn" ${count === 0 || hasLockedOrder ? "disabled" : ""}>
         ${hasLockedOrder ? "Order In Progress" : "Go To Checkout"}
       </button>
-      ${canVenue ? `<button class="inline-btn ghost" id="goVenueBtn">Venue Ops</button>` : ""}
-      ${canRunner ? `<button class="inline-btn ghost" id="goRunnerBtn">Runner Dashboard</button>` : ""}
-      ${permissions.runner || permissions.venue ? `<button class="inline-btn ghost" id="staffLoginBtn">Staff Login</button>` : ""}
-      ${permissions.runner || permissions.venue ? `<button class="inline-btn ghost" id="staffLogoutBtn">Logout</button>` : ""}
       <button class="inline-btn ghost" id="clearCartBtn" ${count === 0 || hasLockedOrder ? "disabled" : ""}>Clear</button>
+      `
+          : `
+      Staff role active. Checkout actions are hidden on this view.
+      `
+      }
+      ${canVendor ? `<button class="inline-btn ghost" id="goVendorOpsBtn">Vendor Ops</button>` : ""}
+      ${canVenue ? `<button class="inline-btn ghost" id="goVenueOpsBtn">Venue Ops</button>` : ""}
+      ${
+        canRunner
+          ? `
+      <button class="inline-btn ghost" id="goRunnerDashboardBtn">Runner Dashboard</button>
+      `
+          : ""
+      }
+      ${renderStaffSessionButton(venueSlug, role, permissions)}
     </section>
   `;
   bindHeroToolbarButtons();
-
-  const modeCards = document.querySelectorAll("[data-delivery-mode]");
-  modeCards.forEach((card) => {
-    card.addEventListener("click", () => {
-      const selectedMode = card.getAttribute("data-delivery-mode");
-      if (!selectedMode) return;
-      writePreferredDeliveryMode(venueSlug, selectedMode);
+  document.querySelectorAll("[data-menu-category]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const nextCategory = button.getAttribute("data-menu-category");
+      if (!nextCategory) return;
+      writeMenuCategoryFilter(venueSlug, nextCategory);
       renderVenueMenu(venueSlug, venue, role, apiBase);
     });
   });
 
-  const addButtons = document.querySelectorAll("[data-add-id]");
-  addButtons.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      if (hasLockedOrder) return;
-      const itemId = btn.getAttribute("data-add-id");
-      const menuItem = venue.menuItems.find((x) => x.id === itemId);
-      if (!menuItem) return;
-      addItemToCart(venueSlug, menuItem);
-      renderVenueMenu(venueSlug, venue, role, apiBase);
-    });
-  });
-
-  const goCheckoutBtn = document.getElementById("goCheckoutBtn");
-  if (goCheckoutBtn) {
-    goCheckoutBtn.addEventListener("click", () => {
-        if (hasLockedOrder) {
-          setRoute(`/order-status/${activeOrder.order_id}`);
-          return;
-        }
-        setRoute("/checkout");
+  if (isCustomerRole) {
+    const modeCards = document.querySelectorAll("[data-delivery-mode]");
+    modeCards.forEach((card) => {
+      card.addEventListener("click", () => {
+        const selectedMode = card.getAttribute("data-delivery-mode");
+        if (!selectedMode) return;
+        writePreferredDeliveryMode(venueSlug, selectedMode);
+        renderVenueMenu(venueSlug, venue, role, apiBase);
       });
+    });
+  }
+
+  if (canVendor && isVendorRole) {
+    document.getElementById("vendorAddItemCard")?.addEventListener("click", async () => {
+      const nextItem = promptForMenuItem();
+      if (!nextItem) return;
+      try {
+        await saveMenuItem(apiBase, vendorAuth, venueSlug, nextItem, true);
+        await renderVenueMenu(venueSlug, venue, role, apiBase);
+      } catch (error) {
+        alert(`Could not create menu item: ${error.message}`);
+      }
+    });
+    document.getElementById("vendorAddItemCard")?.addEventListener("keydown", async (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      const nextItem = promptForMenuItem();
+      if (!nextItem) return;
+      try {
+        await saveMenuItem(apiBase, vendorAuth, venueSlug, nextItem, true);
+        await renderVenueMenu(venueSlug, venue, role, apiBase);
+      } catch (error) {
+        alert(`Could not create menu item: ${error.message}`);
+      }
+    });
+    document.querySelectorAll(".vendor-menu-edit-btn").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const itemId = button.getAttribute("data-menu-item-id");
+        const existing = menuItems.find((item) => item.item_id === itemId);
+        if (!existing) return;
+        const nextItem = promptForMenuItem(existing);
+        if (!nextItem) return;
+        try {
+          await saveMenuItem(apiBase, vendorAuth, venueSlug, { ...existing, ...nextItem }, false);
+          await renderVenueMenu(venueSlug, venue, role, apiBase);
+        } catch (error) {
+          alert(`Could not update menu item: ${error.message}`);
+        }
+      });
+    });
+
+    document.querySelectorAll(".vendor-menu-delete-btn").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const itemId = button.getAttribute("data-menu-item-id");
+        if (!itemId) return;
+        const confirmed = window.confirm(`Delete menu item "${itemId}"?`);
+        if (!confirmed) return;
+        try {
+          await deleteMenuItem(apiBase, vendorAuth, venueSlug, itemId);
+          await renderVenueMenu(venueSlug, venue, role, apiBase);
+        } catch (error) {
+          alert(`Could not delete menu item: ${error.message}`);
+        }
+      });
+    });
+  }
+
+  if (isCustomerRole) {
+    const addButtons = document.querySelectorAll("[data-add-id]");
+    addButtons.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (hasLockedOrder) return;
+        const itemId = btn.getAttribute("data-add-id");
+        const menuItem = menuItems.find((x) => x.id === itemId);
+        if (!menuItem) return;
+        addItemToCart(venueSlug, menuItem);
+        renderVenueMenu(venueSlug, venue, role, apiBase);
+      });
+    });
   }
 
   document.getElementById("resumeActiveOrderBtn")?.addEventListener("click", () => {
     if (!activeOrder?.order_id) return;
     setRoute(`/order-status/${activeOrder.order_id}`);
   });
-
-  const clearCartBtn = document.getElementById("clearCartBtn");
-  if (clearCartBtn) {
-    clearCartBtn.addEventListener("click", () => {
-      if (hasLockedOrder) return;
-      clearCart(venueSlug);
-      renderVenueMenu(venueSlug, venue, role, apiBase);
-    });
-  }
-
-  document.getElementById("reorderRoundBtn")?.addEventListener("click", () => {
-    if (hasLockedOrder) return;
-    writeCart(venueSlug, reorderRound);
-    clearReorderRound(venueSlug);
-    renderVenueMenu(venueSlug, venue, role, apiBase);
-  });
-
-  if (canRunner) {
-    document.getElementById("goRunnerBtn")?.addEventListener("click", () => setRoute("/runner"));
-  }
-  if (canVenue) {
-    document.getElementById("goVenueBtn")?.addEventListener("click", () => setRoute("/venue"));
-  }
-  document.getElementById("staffLoginBtn")?.addEventListener("click", async () => {
-    try {
-      const desiredRole = role === "admin" ? "admin" : permissions.venue ? "venue" : "runner";
-      const ok = await loginStaff(apiBase, venueSlug, desiredRole);
-      if (ok) render();
-    } catch (error) {
-      alert(`Staff login failed: ${error.message}`);
-    }
-  });
-  document.getElementById("staffLogoutBtn")?.addEventListener("click", () => {
-    clearStaffSession();
-    render();
+  bindCartSectionButtons({
+    venueSlug,
+    venue,
+    role,
+    permissions,
+    apiBase,
+    hasLockedOrder,
+    activeOrder,
+    reorderRound,
+    onChanged: () => renderVenueMenu(venueSlug, venue, role, apiBase)
   });
 }
 
 async function renderCheckout(venueSlug, venue, apiBase) {
   const cart = readCart(venueSlug);
   const savedProfile = await hydrateCustomerProfile(apiBase, venueSlug);
+  window.scrollTo({ top: 0, left: 0, behavior: "auto" });
   if (cart.length === 0) {
     app.innerHTML = `
       <section class="hero">
@@ -1033,14 +1729,20 @@ async function renderCheckout(venueSlug, venue, apiBase) {
 
   const total = formatPennies(totalPennies(cart));
   const hasRememberedProfile = Boolean(savedProfile?.token);
-  const defaultCheckoutType = hasRememberedProfile ? "remembered" : "guest";
+  const defaultCheckoutType = "remembered";
   const menuSelectedDeliveryMode = readPreferredDeliveryMode(venueSlug);
+  const pendingTipAmount = readPendingTipAmount(venueSlug);
+  const finalCheckoutTotal = formatPennies(totalPennies(cart) + pendingTipAmount);
+  const profileDeliveryMode =
+    savedProfile?.preferredDeliveryMode || savedProfile?.lastDeliveryMode || savedProfile?.deliveryMode || "";
+  const profileDeliveryTarget =
+    savedProfile?.preferredDeliveryTarget || savedProfile?.lastDeliveryTarget || savedProfile?.deliveryTarget || "";
   const preferredDeliveryMode =
-    menuSelectedDeliveryMode || savedProfile?.deliveryMode || venue.fulfillmentModes[0]?.label || "";
+    menuSelectedDeliveryMode || profileDeliveryMode || venue.fulfillmentModes[0]?.label || "";
   const defaultDeliveryTarget =
-    (menuSelectedDeliveryMode && menuSelectedDeliveryMode !== savedProfile?.deliveryMode
+    (menuSelectedDeliveryMode && menuSelectedDeliveryMode !== profileDeliveryMode
       ? ""
-      : savedProfile?.deliveryTarget) ||
+      : profileDeliveryTarget) ||
     (preferredDeliveryMode === "Click & Collect"
       ? "Collection lane"
       : preferredDeliveryMode === "Nearest Point"
@@ -1064,7 +1766,16 @@ async function renderCheckout(venueSlug, venue, apiBase) {
           )
           .join("")}
       </ul>
-      <p class="summary-total">Total: <strong>${total}</strong></p>
+      <p class="summary-total" id="checkoutTotalLine">Final Total: <strong>${finalCheckoutTotal}</strong></p>
+      <div class="tip-summary-card">
+        <div>
+          <strong>Tip</strong>
+          <p class="api-note" id="checkoutTipSummary">
+            ${pendingTipAmount > 0 ? `Tip to be added: ${escapeHtml(formatPennies(pendingTipAmount))}` : "No tip added yet."}
+          </p>
+        </div>
+        <button class="inline-btn ghost" type="button" id="checkoutTipBtn">${pendingTipAmount > 0 ? "Edit Tip" : "Add Tip"}</button>
+      </div>
     </section>
 
     <section class="form-card">
@@ -1073,37 +1784,25 @@ async function renderCheckout(venueSlug, venue, apiBase) {
         ${
           hasRememberedProfile
             ? "Recognized customer profile loaded for faster checkout on this device."
-            : "First order? Choose guest checkout or let Drinq remember your details for faster future orders."
+            : "Your first order creates a stored customer profile automatically so repeat checkout is faster."
         }
       </p>
+      <div id="accountRecognition"></div>
       <form id="checkoutForm">
         <input type="hidden" name="checkoutType" value="${defaultCheckoutType}" />
-        ${
-          hasRememberedProfile
-            ? `
-          <div class="choice-note">
-            <strong>Remembered customer</strong><br />
-            Future orders on this device can prefill your delivery details automatically.
-          </div>
-        `
-            : `
-          <div class="checkout-choice-grid" id="checkoutChoiceGrid">
-            <button class="choice-btn choice-btn-selected" type="button" data-checkout-type="guest">
-              <strong>Checkout As Guest</strong><br />
-              Place this order without saving a customer profile.
-            </button>
-            <button class="choice-btn" type="button" data-checkout-type="remembered">
-              <strong>Faster Future Orders</strong><br />
-              Save contact and delivery details silently for next time.
-            </button>
-          </div>
-        `
-        }
-        <label>Name</label>
-        <input name="name" required placeholder="Your name" value="${escapeHtml(savedProfile?.name || "")}" />
+        <div class="choice-note">
+          <strong>${hasRememberedProfile ? "Recognized customer" : "Silent registration enabled"}</strong><br />
+          Drinq stores your checkout profile after ordering so repeat checkout can prefill your details.
+        </div>
+        <div id="nameFieldGroup">
+          <label>Name</label>
+          <input name="name" required placeholder="Your name" value="${escapeHtml(savedProfile?.name || "")}" />
+        </div>
 
-        <label>Email</label>
-        <input name="email" required type="email" placeholder="name@email.com" value="${escapeHtml(savedProfile?.email || "")}" />
+        <div id="emailFieldGroup">
+          <label>Email</label>
+          <input name="email" required type="email" placeholder="name@email.com" value="${escapeHtml(savedProfile?.email || "")}" />
+        </div>
 
         <label>Delivery Mode</label>
         <select name="deliveryMode" required>
@@ -1118,11 +1817,6 @@ async function renderCheckout(venueSlug, venue, apiBase) {
         <label>Seat / Pickup Point</label>
         <input name="deliveryTarget" required placeholder="E.g. Block N220, Row 6, Seat 121" value="${escapeHtml(defaultDeliveryTarget)}" />
 
-        <label class="checkbox">
-          <input type="checkbox" name="mailingList" checked />
-          Add me to venue updates (mailing list)
-        </label>
-
         <button class="add-btn" type="submit">Pay & Place Order</button>
         <button class="inline-btn ghost" type="button" id="backMenuBtn">Back To Menu</button>
         <button class="inline-btn ghost" type="button" id="forgetDetailsBtn">Forget Saved Details</button>
@@ -1133,22 +1827,175 @@ async function renderCheckout(venueSlug, venue, apiBase) {
   `;
 
   document.getElementById("backMenuBtn")?.addEventListener("click", () => setRoute("/"));
+  document.getElementById("checkoutTipBtn")?.addEventListener("click", () => {
+    openTipModal({
+      title: "Add Tip",
+      subtitle: "Choose a tip amount for this order.",
+      initialAmountPennies: pendingTipAmount,
+      confirmLabel: "Save Tip",
+      allowClear: true,
+      onConfirm: async (tipAmountPennies) => {
+        writePendingTipAmount(venueSlug, tipAmountPennies);
+        const summary = document.getElementById("checkoutTipSummary");
+        const button = document.getElementById("checkoutTipBtn");
+        if (summary) {
+          summary.textContent = tipAmountPennies > 0 ? `Tip to be added: ${formatPennies(tipAmountPennies)}` : "No tip added yet.";
+        }
+        const totalLine = document.getElementById("checkoutTotalLine");
+        if (totalLine) {
+          totalLine.innerHTML = `Final Total: <strong>${escapeHtml(formatPennies(totalPennies(cart) + tipAmountPennies))}</strong>`;
+        }
+        if (button) {
+          button.textContent = tipAmountPennies > 0 ? "Edit Tip" : "Add Tip";
+        }
+      }
+    });
+  });
   document.getElementById("forgetDetailsBtn")?.addEventListener("click", () => {
     clearCustomerProfile(venueSlug);
     renderCheckout(venueSlug, venue, apiBase);
   });
 
   const checkoutTypeInput = document.querySelector('input[name="checkoutType"]');
-  const choiceButtons = document.querySelectorAll("[data-checkout-type]");
-  choiceButtons.forEach((button) => {
-    button.addEventListener("click", () => {
-      const checkoutType = button.getAttribute("data-checkout-type");
-      if (!checkoutTypeInput || !checkoutType) return;
-      checkoutTypeInput.value = checkoutType;
-      choiceButtons.forEach((other) => other.classList.remove("choice-btn-selected"));
-      button.classList.add("choice-btn-selected");
+  const nameFieldGroup = document.getElementById("nameFieldGroup");
+  const emailFieldGroup = document.getElementById("emailFieldGroup");
+  const nameInput = document.querySelector('input[name="name"]');
+  const emailInput = document.querySelector('input[name="email"]');
+  const accountRecognition = document.getElementById("accountRecognition");
+
+  const setMemberFieldVisibility = (lookupState) => {
+    const isMember = String(lookupState?.account_level || savedProfile?.accountLevel || "") === "member";
+    nameFieldGroup?.classList.toggle("checkout-field-hidden", isMember);
+    emailFieldGroup?.classList.toggle("checkout-field-hidden", isMember);
+    if (!isMember) return;
+    if (nameInput && lookupState?.name) {
+      nameInput.value = String(lookupState.name);
+    }
+    if (emailInput && lookupState?.email) {
+      emailInput.value = String(lookupState.email);
+    }
+  };
+  setMemberFieldVisibility(savedProfile?.accountLevel === "member" ? { account_level: "member" } : null);
+
+  const renderAccountRecognition = (state) => {
+    if (!accountRecognition) return;
+    if (!state) {
+      accountRecognition.innerHTML = "";
+      setMemberFieldVisibility(null);
+      return;
+    }
+    if (!state.exists) {
+      accountRecognition.innerHTML = "";
+      setMemberFieldVisibility(null);
+      return;
+    }
+    if (String(state.account_level || "profile") === "member") {
+      accountRecognition.innerHTML = "";
+      setMemberFieldVisibility(state);
+      return;
+    }
+    setMemberFieldVisibility(state);
+    accountRecognition.innerHTML = `
+      <div class="choice-note account-recognition-card">
+        <strong>Finish sign up for member privileges</strong>
+        <ol class="account-steps">
+          <li>Use your recognized checkout email.</li>
+          <li>Set a password for your existing saved profile.</li>
+          <li>Unlock member privileges on future orders.</li>
+        </ol>
+        <label>Password</label>
+        <input type="password" id="memberPasswordInput" placeholder="Create a password" minlength="8" />
+        <label>Confirm Password</label>
+        <input type="password" id="memberPasswordConfirmInput" placeholder="Confirm password" minlength="8" />
+        <button class="inline-btn" type="button" id="makeAccountBtn">Set Password</button>
+        <p class="api-note" id="accountUpgradeMsg"></p>
+      </div>
+    `;
+    document.getElementById("makeAccountBtn")?.addEventListener("click", () => {
+      const password = String(document.getElementById("memberPasswordInput")?.value || "");
+      const confirmPassword = String(document.getElementById("memberPasswordConfirmInput")?.value || "");
+      const upgradeMsg = document.getElementById("accountUpgradeMsg");
+      if (password.length < 8) {
+        if (upgradeMsg) upgradeMsg.textContent = "Password must be at least 8 characters.";
+        return;
+      }
+      if (password !== confirmPassword) {
+        if (upgradeMsg) upgradeMsg.textContent = "Passwords do not match.";
+        return;
+      }
+      if (upgradeMsg) {
+        upgradeMsg.textContent = "Saving member password...";
+      }
+      fetch(`${apiBase}/api/customers/upgrade-account`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          venue_slug: venueSlug,
+          email: String(emailInput?.value || "").trim(),
+          password
+        })
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.detail || `Upgrade failed (${response.status})`);
+          }
+          return response.json();
+        })
+        .then((profile) => {
+          writeCustomerProfile(venueSlug, {
+            customerId: Number(profile.customer_id || savedProfile?.customerId || 0) || null,
+            token: String(profile.customer_token || savedProfile?.token || ""),
+            name: String(savedProfile?.name || ""),
+            email: String(profile.email || emailInput?.value || ""),
+            deliveryMode: String(profile.delivery_mode || savedProfile?.deliveryMode || preferredDeliveryMode || ""),
+            deliveryTarget: String(profile.delivery_target || savedProfile?.deliveryTarget || defaultDeliveryTarget || ""),
+            preferredDeliveryMode: String(profile.preferred_delivery_mode || savedProfile?.preferredDeliveryMode || ""),
+            preferredDeliveryTarget: String(profile.preferred_delivery_target || savedProfile?.preferredDeliveryTarget || ""),
+            lastDeliveryMode: String(profile.last_delivery_mode || savedProfile?.lastDeliveryMode || preferredDeliveryMode || ""),
+            lastDeliveryTarget: String(profile.last_delivery_target || savedProfile?.lastDeliveryTarget || defaultDeliveryTarget || ""),
+            checkoutType: "remembered",
+            accountLevel: String(profile.account_level || "member")
+          });
+          renderAccountRecognition({ exists: true, account_level: "member" });
+        })
+        .catch((error) => {
+          if (upgradeMsg) upgradeMsg.textContent = error.message;
+        });
     });
+  };
+
+  let latestLookupEmail = "";
+  const runAccountRecognition = async () => {
+    const nextEmail = String(emailInput?.value || "").trim().toLowerCase();
+    if (!nextEmail || !nextEmail.includes("@")) {
+      latestLookupEmail = "";
+      renderAccountRecognition(null);
+      return;
+    }
+    latestLookupEmail = nextEmail;
+    try {
+      const result = await lookupCustomerAccount(apiBase, venueSlug, nextEmail);
+      if (latestLookupEmail !== nextEmail) return;
+      renderAccountRecognition(result);
+    } catch {
+      if (latestLookupEmail !== nextEmail) return;
+      renderAccountRecognition(null);
+    }
+  };
+
+  emailInput?.addEventListener("blur", runAccountRecognition);
+  emailInput?.addEventListener("change", runAccountRecognition);
+  emailInput?.addEventListener("input", () => {
+    if (!accountRecognition) return;
+    if (String(emailInput.value || "").trim().toLowerCase() !== latestLookupEmail) {
+      accountRecognition.innerHTML = "";
+      setMemberFieldVisibility(null);
+    }
   });
+  if (savedProfile?.email) {
+    void runAccountRecognition();
+  }
 
   const form = document.getElementById("checkoutForm");
   const message = document.getElementById("checkoutMsg");
@@ -1164,27 +2011,8 @@ async function renderCheckout(venueSlug, venue, apiBase) {
     const deliveryMode = String(formData.get("deliveryMode") || "").trim();
     const deliveryTarget = String(formData.get("deliveryTarget") || "").trim();
     const checkoutType = String(formData.get("checkoutType") || defaultCheckoutType).trim();
-    const mailingList = Boolean(formData.get("mailingList"));
 
     try {
-      if (checkoutType === "guest") {
-        clearCustomerProfile(venueSlug);
-      }
-
-      if (mailingList) {
-        try {
-          const registerRes = await fetch(`${apiBase}/api/register`, {
-            method: "POST",
-            body: JSON.stringify({
-              name,
-              email,
-              venue_slug: venueSlug
-            })
-          });
-          void registerRes;
-        } catch {}
-      }
-
       const orderRes = await fetch(`${apiBase}/api/orders`, {
         method: "POST",
         body: JSON.stringify({
@@ -1200,7 +2028,8 @@ async function renderCheckout(venueSlug, venue, apiBase) {
             quantity: item.quantity
           })),
           checkout_type: checkoutType,
-          customer_token: savedProfile?.token || null
+          customer_token: savedProfile?.token || null,
+          tip_amount_pennies: readPendingTipAmount(venueSlug)
         })
       });
 
@@ -1209,18 +2038,25 @@ async function renderCheckout(venueSlug, venue, apiBase) {
       }
 
       const orderData = await orderRes.json();
-      if (checkoutType === "remembered" && orderData.customer_profile) {
+      if (orderData.customer_profile) {
         writeCustomerProfile(venueSlug, {
           customerId: Number(orderData.customer_profile.customer_id || 0) || null,
           token: String(orderData.customer_profile.customer_token || ""),
           name,
           email,
-          deliveryMode,
-          deliveryTarget,
-          checkoutType
+          deliveryMode: String(orderData.customer_profile.delivery_mode || deliveryMode),
+          deliveryTarget: String(orderData.customer_profile.delivery_target || deliveryTarget),
+          preferredDeliveryMode: String(orderData.customer_profile.preferred_delivery_mode || ""),
+          preferredDeliveryTarget: String(orderData.customer_profile.preferred_delivery_target || ""),
+          lastDeliveryMode: String(orderData.customer_profile.last_delivery_mode || deliveryMode),
+          lastDeliveryTarget: String(orderData.customer_profile.last_delivery_target || deliveryTarget),
+          checkoutType,
+          accountLevel: String(orderData.customer_profile.account_level || "profile")
         });
       }
+      writePreferredDeliveryMode(venueSlug, deliveryMode);
       writeActiveOrderId(venueSlug, orderData.order_id);
+      clearPendingTipAmount(venueSlug);
       clearCart(venueSlug);
       setRoute(`/order-status/${orderData.order_id}`);
     } catch (error) {
@@ -1296,33 +2132,41 @@ function runnerActionButtons(order) {
   const showCancel = ["assigned", "loaded", "en_route", "arrived"].includes(status);
   return `
     <div class="runner-actions">
-      <button class="inline-btn status-btn" data-order-id="${order.order_id}" data-status="${nextAction.status}">${nextAction.label}</button>
-      ${showCancel ? `<button class="inline-btn ghost status-btn" data-order-id="${order.order_id}" data-status="cancelled">Cancel</button>` : ""}
+      <button class="inline-btn status-btn" type="button" data-order-id="${order.order_id}" data-status="${nextAction.status}">${nextAction.label}</button>
+      ${showCancel ? `<button class="inline-btn ghost status-btn" type="button" data-order-id="${order.order_id}" data-status="cancelled">Cancel</button>` : ""}
     </div>
   `;
 }
 
-function venueStatusButtons(orderId, status) {
+function venueStatusButtons(order, isAdmin) {
+  const orderId = order.order_id;
+  const status = order.status;
   const normalizedStatus = String(status || "").toLowerCase();
   const canAccept = normalizedStatus === "received";
   const canReject = normalizedStatus === "received";
   const canReady = normalizedStatus === "accepted";
+  const canFail = ["accepted", "ready", "assigned", "loaded", "en_route", "arrived"].includes(normalizedStatus);
+  const canRefund = isAdmin && String(order.payment_status || "").toLowerCase() === "captured";
   return `
     <div class="runner-actions">
       <button class="inline-btn venue-action-btn" data-action="accept" data-order-id="${orderId}" ${canAccept ? "" : "disabled"}>Accept</button>
       <button class="inline-btn ghost venue-action-btn" data-action="reject" data-order-id="${orderId}" ${canReject ? "" : "disabled"}>Reject</button>
       <button class="inline-btn venue-action-btn" data-action="ready" data-order-id="${orderId}" ${canReady ? "" : "disabled"}>Mark Ready</button>
+      <button class="inline-btn ghost venue-action-btn" data-action="fail" data-order-id="${orderId}" ${canFail ? "" : "disabled"}>Fail Order</button>
+      ${canRefund ? `<button class="inline-btn ghost venue-action-btn" data-action="refund" data-order-id="${orderId}">Refund</button>` : ""}
     </div>
   `;
 }
 
-function venueCollectButtons(order) {
+function venueCollectButtons(order, isAdmin) {
   const status = String(order.status || "").toLowerCase();
   const canAccept = status === "received";
   const canReject = status === "received";
   const canReady = status === "accepted";
   const canCollect = status === "ready_for_collection";
   const canMarkUncollected = status === "ready_for_collection";
+  const canFail = ["accepted", "ready_for_collection"].includes(status);
+  const canRefund = isAdmin && String(order.payment_status || "").toLowerCase() === "captured";
   return `
     <div class="runner-actions">
       <button class="inline-btn venue-action-btn" data-action="accept" data-order-id="${order.order_id}" ${canAccept ? "" : "disabled"}>Accept</button>
@@ -1330,6 +2174,8 @@ function venueCollectButtons(order) {
       <button class="inline-btn venue-action-btn" data-action="ready" data-order-id="${order.order_id}" ${canReady ? "" : "disabled"}>Ready For Collection</button>
       <button class="inline-btn venue-action-btn" data-action="collect" data-order-id="${order.order_id}" data-pickup-code="${escapeHtml(order.pickup_code || "")}" ${canCollect ? "" : "disabled"}>Verify Collected</button>
       <button class="inline-btn ghost venue-action-btn" data-action="uncollected" data-order-id="${order.order_id}" ${canMarkUncollected ? "" : "disabled"}>Mark Uncollected</button>
+      <button class="inline-btn ghost venue-action-btn" data-action="fail" data-order-id="${order.order_id}" ${canFail ? "" : "disabled"}>Fail Order</button>
+      ${canRefund ? `<button class="inline-btn ghost venue-action-btn" data-action="refund" data-order-id="${order.order_id}">Refund</button>` : ""}
     </div>
   `;
 }
@@ -1345,33 +2191,54 @@ async function postOrderStatus(apiBase, orderId, status, authHeader) {
   }
 }
 
-async function renderRunnerDashboard(venueSlug, apiBase, authHeader) {
+async function renderRunnerStream(venueSlug, apiBase, authHeader) {
   stopPagePoll();
   const venue = VENUES[venueSlug];
+  const role = getRole();
+  const permissions = ROLE_PERMISSIONS[role] ?? ROLE_PERMISSIONS.customer;
+  const canVendor = permissions.vendor || role === "admin";
+  const canVenue = permissions.venue || role === "admin";
+  const canRunner = permissions.runner || role === "admin";
+  const toolbarButtons = [
+    { label: "Menu", action: "route", target: "/" },
+    { label: "Stream", action: "route", target: "/runner-stream", active: true }
+  ];
   app.innerHTML = `
     ${renderVenueHero(venue, {
-      compact: true,
-      contextChip: "RUNNER DASHBOARD",
-      title: "Live Orders",
-      copy: `Venue: ${venue.name} · API: ${apiBase}`
+      contextChip: "STREAM",
+      toolbarButtons
     })}
-    <section class="hero-tools">
-      <button class="inline-btn" id="runnerRefreshBtn">Refresh</button>
-      <button class="inline-btn ghost" id="runnerBackBtn">Back To Menu</button>
+    <section class="category-slug stream-action-row">
+      <button class="category-chip stream-action-chip" type="button" id="runnerStreamRefreshBtn">Refresh</button>
     </section>
-    <section id="runnerOrders"></section>
+    <section class="menu-grid stream-grid" id="runnerOrders"></section>
+    <section class="cart-mini" id="cartSection">
+      Staff role active. Checkout actions are hidden on this view.
+      ${canVendor ? `<button class="inline-btn ghost" id="goVendorOpsBtn">Vendor Ops</button>` : ""}
+      ${canVenue ? `<button class="inline-btn ghost" id="goVenueOpsBtn">Venue Ops</button>` : ""}
+      ${canRunner ? `<button class="inline-btn ghost" id="goRunnerDashboardBtn">Runner Dashboard</button>` : ""}
+      ${renderStaffSessionButton(venueSlug, role, permissions)}
+    </section>
   `;
-
-  document.getElementById("runnerRefreshBtn")?.addEventListener("click", () => {
-    renderRunnerDashboard(venueSlug, apiBase, authHeader);
+  bindHeroToolbarButtons();
+  bindCartSectionButtons({
+    venueSlug,
+    venue,
+    role,
+    permissions,
+    apiBase,
+    onChanged: () => renderRunnerStream(venueSlug, apiBase, authHeader)
   });
-  document.getElementById("runnerBackBtn")?.addEventListener("click", () => setRoute("/"));
+
+  document.getElementById("runnerStreamRefreshBtn")?.addEventListener("click", () => {
+    renderRunnerStream(venueSlug, apiBase, authHeader);
+  });
 
   const container = document.getElementById("runnerOrders");
   container.innerHTML = `<section class="form-card"><p>Loading orders...</p></section>`;
 
   try {
-    const loadRunnerDashboardState = async () => {
+    const loadRunnerStreamState = async () => {
       const activeOrder = await fetchRunnerActiveOrder(apiBase, venueSlug, authHeader);
       if (activeOrder) {
         return { activeOrder, orders: [] };
@@ -1382,7 +2249,7 @@ async function renderRunnerDashboard(venueSlug, apiBase, authHeader) {
         cache: "no-store"
       });
       if (!res.ok) {
-        throw new Error(`Could not fetch orders (${res.status})`);
+        throw makeHttpError(`Could not fetch orders (${res.status})`, res.status);
       }
       const data = await res.json();
       const orders = (data.orders || []).filter((order) =>
@@ -1391,7 +2258,7 @@ async function renderRunnerDashboard(venueSlug, apiBase, authHeader) {
       return { activeOrder: null, orders };
     };
 
-    const state = await loadRunnerDashboardState();
+    const state = await loadRunnerStreamState();
     let signature = JSON.stringify({
       activeOrderId: state.activeOrder?.order_id || null,
       activeOrderVersion: state.activeOrder?.version || null,
@@ -1401,7 +2268,7 @@ async function renderRunnerDashboard(venueSlug, apiBase, authHeader) {
     bindRunnerStatusButtons(container, { venueSlug, apiBase, authHeader });
 
     startPagePoll(async () => {
-      const nextState = await loadRunnerDashboardState();
+      const nextState = await loadRunnerStreamState();
       const nextSignature = JSON.stringify({
         activeOrderId: nextState.activeOrder?.order_id || null,
         activeOrderVersion: nextState.activeOrder?.version || null,
@@ -1414,79 +2281,288 @@ async function renderRunnerDashboard(venueSlug, apiBase, authHeader) {
       }
     });
   } catch (error) {
-    container.innerHTML = `<section class="unknown">Runner dashboard error: ${escapeHtml(error.message)}</section>`;
+    if (isStaffSessionError(error)) {
+      clearStaffSession();
+      render();
+      return;
+    }
+    container.innerHTML = `<section class="unknown">Runner stream error: ${escapeHtml(error.message)}</section>`;
   }
 }
 
-async function renderVenueDashboard(venueSlug, apiBase, authHeader) {
+async function renderVendorStream(venueSlug, apiBase, authHeader) {
   stopPagePoll();
+  const venue = VENUES[venueSlug];
+  const role = getRole();
+  const permissions = ROLE_PERMISSIONS[role] ?? ROLE_PERMISSIONS.customer;
+  const canVendor = permissions.vendor || role === "admin";
+  const canVenue = permissions.venue || role === "admin";
+  const canRunner = permissions.runner || role === "admin";
+  const currentStaffRole = getStaffSession()?.role || "";
+  const canManageMenu = currentStaffRole === "vendor" || currentStaffRole === "admin";
+  const vendorDisplayName = getVendorDisplayName(venueSlug);
+  const toolbarButtons = [
+    { label: "Menu", action: "route", target: "/" },
+    { label: "Stream", action: "route", target: "/stream", active: true }
+  ];
+  app.innerHTML = `
+    ${renderVenueHero(venue, {
+      headingTitle: vendorDisplayName,
+      contextChip: "STREAM",
+      toolbarButtons
+    })}
+    <section class="category-slug stream-action-row">
+      <button class="category-chip stream-action-chip" type="button" id="streamRefreshBtn">Refresh</button>
+    </section>
+    <section class="menu-grid stream-grid" id="venueOrders"></section>
+    <section class="cart-mini" id="cartSection">
+      Staff role active. Checkout actions are hidden on this view.
+      ${canVendor ? `<button class="inline-btn ghost" id="goVendorOpsBtn">Vendor Ops</button>` : ""}
+      ${canVenue ? `<button class="inline-btn ghost" id="goVenueOpsBtn">Venue Ops</button>` : ""}
+      ${canRunner ? `<button class="inline-btn ghost" id="goRunnerDashboardBtn">Runner Dashboard</button>` : ""}
+      ${renderStaffSessionButton(venueSlug, role, permissions)}
+    </section>
+    ${canManageMenu ? `<section id="adminMenuManager"></section>` : ""}
+  `;
+  bindHeroToolbarButtons();
+  bindCartSectionButtons({
+    venueSlug,
+    venue,
+    role,
+    permissions,
+    apiBase,
+    onChanged: () => renderVendorStream(venueSlug, apiBase, authHeader)
+  });
+
+  document.getElementById("streamRefreshBtn")?.addEventListener("click", () => {
+    renderVendorStream(venueSlug, apiBase, authHeader);
+  });
+
+  const container = document.getElementById("venueOrders");
+  const adminMenuContainer = document.getElementById("adminMenuManager");
+  container.innerHTML = `<section class="form-card"><p>Loading venue orders...</p></section>`;
+  if (adminMenuContainer) {
+    adminMenuContainer.innerHTML = `<section class="form-card"><p>Loading menu admin...</p></section>`;
+  }
+
+  try {
+    const loadVenueDashboardState = async () => {
+      const [ordersRes, menuItems] = await Promise.all([
+        fetch(`${apiBase}/api/orders?venue_slug=${encodeURIComponent(venueSlug)}&limit=50`, {
+          headers: { Authorization: authHeader },
+          cache: "no-store"
+        }),
+        canManageMenu ? fetchMenuItems(apiBase, venueSlug, { includeInactive: true, authHeader }) : Promise.resolve([])
+      ]);
+      if (!ordersRes.ok) {
+        throw makeHttpError(`Could not fetch orders (${ordersRes.status})`, ordersRes.status);
+      }
+      const data = await ordersRes.json();
+      return { orders: data.orders || [], menuItems };
+    };
+
+    let state = await loadVenueDashboardState();
+    let signature = JSON.stringify(
+      state.orders.map((order) => [
+        order.order_id,
+        order.version,
+        order.status,
+        order.assigned_runner_token || "",
+        order.payment_status || ""
+      ])
+    );
+    renderVenueOrdersDom(container, state.orders, venueSlug, currentStaffRole === "admin");
+    bindVenueActionButtons(container, { venueSlug, apiBase, authHeader });
+    if (canManageMenu && adminMenuContainer) {
+      renderAdminMenuManager(adminMenuContainer, state.menuItems);
+      bindAdminMenuButtons(adminMenuContainer, {
+        venueSlug,
+        apiBase,
+        authHeader,
+        getItems: () => state.menuItems,
+        onUpdated: async () => {
+          await renderVendorStream(venueSlug, apiBase, authHeader);
+        }
+      });
+    }
+
+    startPagePoll(async () => {
+      const nextState = await loadVenueDashboardState();
+      const nextSignature = JSON.stringify(
+        nextState.orders.map((order) => [
+          order.order_id,
+          order.version,
+          order.status,
+          order.assigned_runner_token || "",
+          order.payment_status || ""
+        ])
+      );
+      if (nextSignature !== signature) {
+        signature = nextSignature;
+        state = nextState;
+        renderVenueOrdersDom(container, nextState.orders, venueSlug, currentStaffRole === "admin");
+        bindVenueActionButtons(container, { venueSlug, apiBase, authHeader });
+        if (canManageMenu && adminMenuContainer) {
+          renderAdminMenuManager(adminMenuContainer, nextState.menuItems);
+          bindAdminMenuButtons(adminMenuContainer, {
+            venueSlug,
+            apiBase,
+            authHeader,
+            getItems: () => state.menuItems,
+            onUpdated: async () => {
+              await renderVendorStream(venueSlug, apiBase, authHeader);
+            }
+          });
+        }
+      }
+    });
+  } catch (error) {
+    if (isStaffSessionError(error)) {
+      clearStaffSession();
+      render();
+      return;
+    }
+    container.innerHTML = `<section class="unknown">Venue dashboard error: ${escapeHtml(error.message)}</section>`;
+    if (adminMenuContainer) {
+      adminMenuContainer.innerHTML = "";
+    }
+  }
+}
+
+function renderRunnerDashboardPlaceholder(venueSlug) {
+  const venue = VENUES[venueSlug];
+  app.innerHTML = `
+    ${renderVenueHero(venue, {
+      compact: true,
+      contextChip: "RUNNER DASHBOARD",
+      title: "Runner Dashboard",
+      copy: "Runner account settings, availability controls, and operational support will live here."
+    })}
+    <section class="form-card">
+      <h2>Runner Dashboard</h2>
+      <p>This endpoint is intentionally reserved for the future runner dashboard.</p>
+      <p class="api-note">Planned scope: account changes, availability preferences, support settings, and runner-level controls.</p>
+      <button class="inline-btn" id="runnerDashboardBackBtn">Back To Menu</button>
+    </section>
+  `;
+  document.getElementById("runnerDashboardBackBtn")?.addEventListener("click", () => setRoute("/"));
+}
+
+function renderVendorOpsPlaceholder(venueSlug) {
+  const venue = VENUES[venueSlug];
+  const vendorDisplayName = getVendorDisplayName(venueSlug);
+  const sections = [
+    {
+      id: "analytics",
+      label: "Analytics",
+      title: "Analytics",
+      body: "Track order volume, vendor performance, and top-selling items from one place.",
+      note: "This section will later surface daily trends, category performance, and operational conversion data."
+    },
+    {
+      id: "account",
+      label: "Account",
+      title: "Account",
+      body: "Manage vendor account details, business profile, and commercial settings.",
+      note: "Planned scope: vendor name, payout identity, business metadata, and operator contacts."
+    },
+    {
+      id: "refunds",
+      label: "Refunds",
+      title: "Refunds",
+      body: "Review refund history, disputed orders, and refund controls that need seller attention.",
+      note: "This will become the vendor-facing refund workspace, while admin retains higher-trust controls."
+    },
+    {
+      id: "security",
+      label: "Security",
+      title: "Security",
+      body: "Control staff access, session hygiene, and protection settings for the vendor account.",
+      note: "Planned scope: password or PIN rotation, trusted users, and account security events."
+    },
+    {
+      id: "vendor-support",
+      label: "Vendor Support",
+      title: "Vendor Support",
+      body: "Open support workflows, platform guidance, and issue escalation for the vendor team.",
+      note: "This section will house support requests, onboarding guidance, and recovery actions."
+    }
+  ];
+  app.innerHTML = `
+    ${renderVenueHero(venue, {
+      headingTitle: vendorDisplayName,
+      compact: true,
+      contextChip: "VENDOR OPS",
+      title: "Vendor Operations",
+      copy: "Vendor account settings, payment setup, withdrawals, and vendor management will live here."
+    })}
+    <section class="vendor-ops-shell">
+      <nav class="vendor-ops-nav" aria-label="Vendor operations sections">
+        ${sections
+          .map(
+            (section, index) => `
+          <button
+            class="vendor-ops-nav-btn${index === 0 ? " is-active" : ""}"
+            type="button"
+            data-vendor-ops-target="${escapeHtml(section.id)}"
+          >
+            ${escapeHtml(section.label)}
+          </button>
+        `
+          )
+          .join("")}
+      </nav>
+      <section class="vendor-ops-content">
+        ${sections
+          .map(
+            (section, index) => `
+          <article
+            class="form-card vendor-ops-panel${index === 0 ? " is-active" : ""}"
+            data-vendor-ops-panel="${escapeHtml(section.id)}"
+          >
+            <h2>${escapeHtml(section.title)}</h2>
+            <p>${escapeHtml(section.body)}</p>
+            <p class="api-note">${escapeHtml(section.note)}</p>
+          </article>
+        `
+          )
+          .join("")}
+      </section>
+    </section>
+    <section class="hero-tools">
+      <button class="inline-btn ghost" id="vendorOpsBackBtn">Back To Menu</button>
+    </section>
+  `;
+  document.querySelectorAll("[data-vendor-ops-target]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const target = button.getAttribute("data-vendor-ops-target");
+      if (!target) return;
+      document.querySelectorAll("[data-vendor-ops-target]").forEach((other) => other.classList.remove("is-active"));
+      document.querySelectorAll("[data-vendor-ops-panel]").forEach((panel) => panel.classList.remove("is-active"));
+      button.classList.add("is-active");
+      document.querySelector(`[data-vendor-ops-panel="${target}"]`)?.classList.add("is-active");
+    });
+  });
+  document.getElementById("vendorOpsBackBtn")?.addEventListener("click", () => setRoute("/"));
+}
+
+function renderVenueOpsPlaceholder(venueSlug) {
   const venue = VENUES[venueSlug];
   app.innerHTML = `
     ${renderVenueHero(venue, {
       compact: true,
       contextChip: "VENUE OPS",
-      title: "Order Management",
-      copy: `Venue: ${venue.name} · API: ${apiBase}`
+      title: "Venue Operations",
+      copy: "Account settings, payment setup, withdrawals, and venue management will live here."
     })}
-    <section class="hero-tools">
-      <button class="inline-btn" id="venueRefreshBtn">Refresh</button>
-      <button class="inline-btn ghost" id="venueBackBtn">Back To Menu</button>
+    <section class="form-card">
+      <h2>Venue Ops</h2>
+      <p>This endpoint is intentionally reserved for the future venue operations dashboard.</p>
+      <p class="api-note">Planned scope: account changes, payment settings, withdrawal controls, and venue management.</p>
+      <button class="inline-btn" id="venueOpsBackBtn">Back To Menu</button>
     </section>
-    <section id="venueOrders"></section>
   `;
-
-  document.getElementById("venueRefreshBtn")?.addEventListener("click", () => {
-    renderVenueDashboard(venueSlug, apiBase, authHeader);
-  });
-  document.getElementById("venueBackBtn")?.addEventListener("click", () => setRoute("/"));
-
-  const container = document.getElementById("venueOrders");
-  container.innerHTML = `<section class="form-card"><p>Loading venue orders...</p></section>`;
-
-  try {
-    const loadVenueDashboardState = async () => {
-      const res = await fetch(`${apiBase}/api/orders?venue_slug=${encodeURIComponent(venueSlug)}&limit=50`, {
-        headers: { Authorization: authHeader },
-        cache: "no-store"
-      });
-      if (!res.ok) {
-        throw new Error(`Could not fetch orders (${res.status})`);
-      }
-      const data = await res.json();
-      return data.orders || [];
-    };
-
-    const orders = await loadVenueDashboardState();
-    let signature = JSON.stringify(
-      orders.map((order) => [
-        order.order_id,
-        order.version,
-        order.status,
-        order.assigned_runner_token || ""
-      ])
-    );
-    renderVenueOrdersDom(container, orders, venueSlug);
-    bindVenueActionButtons(container, { venueSlug, apiBase, authHeader });
-
-    startPagePoll(async () => {
-      const nextOrders = await loadVenueDashboardState();
-      const nextSignature = JSON.stringify(
-        nextOrders.map((order) => [
-          order.order_id,
-          order.version,
-          order.status,
-          order.assigned_runner_token || ""
-        ])
-      );
-      if (nextSignature !== signature) {
-        signature = nextSignature;
-        renderVenueOrdersDom(container, nextOrders, venueSlug);
-        bindVenueActionButtons(container, { venueSlug, apiBase, authHeader });
-      }
-    });
-  } catch (error) {
-    container.innerHTML = `<section class="unknown">Venue dashboard error: ${escapeHtml(error.message)}</section>`;
-  }
+  document.getElementById("venueOpsBackBtn")?.addEventListener("click", () => setRoute("/"));
 }
 
 async function render() {
@@ -1516,22 +2592,30 @@ async function render() {
       renderForbidden(role, "runner", venueSlug, apiBase);
       return;
     }
+    renderRunnerDashboardPlaceholder(venueSlug);
+    return;
+  }
+  if (route.name === "runner-stream") {
+    if (!permissions.runner) {
+      renderForbidden(role, "runner-stream", venueSlug, apiBase);
+      return;
+    }
     let authHeader = getAuthHeader(venueSlug, "runner");
     if (!authHeader) {
       try {
         const ok = await loginStaff(apiBase, venueSlug, role === "admin" ? "admin" : "runner");
         if (!ok) {
-          renderForbidden(role, "runner", venueSlug, apiBase);
+          renderForbidden(role, "runner-stream", venueSlug, apiBase);
           return;
         }
       } catch (error) {
         alert(`Staff login failed: ${error.message}`);
-        renderForbidden(role, "runner", venueSlug, apiBase);
+        renderForbidden(role, "runner-stream", venueSlug, apiBase);
         return;
       }
       authHeader = getAuthHeader(venueSlug, "runner");
     }
-    await renderRunnerDashboard(venueSlug, apiBase, authHeader);
+    await renderRunnerStream(venueSlug, apiBase, authHeader);
     return;
   }
   if (route.name === "venue") {
@@ -1539,22 +2623,38 @@ async function render() {
       renderForbidden(role, "venue", venueSlug, apiBase);
       return;
     }
-    let authHeader = getAuthHeader(venueSlug, "venue");
+    renderVenueOpsPlaceholder(venueSlug);
+    return;
+  }
+  if (route.name === "vendor") {
+    if (!permissions.vendor) {
+      renderForbidden(role, "vendor", venueSlug, apiBase);
+      return;
+    }
+    renderVendorOpsPlaceholder(venueSlug);
+    return;
+  }
+  if (route.name === "stream") {
+    if (!permissions.vendor) {
+      renderForbidden(role, "stream", venueSlug, apiBase);
+      return;
+    }
+    let authHeader = getAuthHeader(venueSlug, "vendor");
     if (!authHeader) {
       try {
-        const ok = await loginStaff(apiBase, venueSlug, role === "admin" ? "admin" : "venue");
+        const ok = await loginStaff(apiBase, venueSlug, role === "admin" ? "admin" : "vendor");
         if (!ok) {
-          renderForbidden(role, "venue", venueSlug, apiBase);
+          renderForbidden(role, "stream", venueSlug, apiBase);
           return;
         }
       } catch (error) {
         alert(`Staff login failed: ${error.message}`);
-        renderForbidden(role, "venue", venueSlug, apiBase);
+        renderForbidden(role, "stream", venueSlug, apiBase);
         return;
       }
-      authHeader = getAuthHeader(venueSlug, "venue");
+      authHeader = getAuthHeader(venueSlug, "vendor");
     }
-    await renderVenueDashboard(venueSlug, apiBase, authHeader);
+    await renderVendorStream(venueSlug, apiBase, authHeader);
     return;
   }
 

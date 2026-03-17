@@ -1,9 +1,11 @@
 import json
+import hashlib
 import sqlite3
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +24,8 @@ app.add_middleware(
 )
 
 DB_PATH = Path(__file__).resolve().parents[1] / "drinq.sqlite3"
+VENUE_TIMEZONE = ZoneInfo("Europe/London")
+MAX_DAILY_DISPLAY_ORDER_NUMBER = 999
 PaymentStatus = Literal["pending", "captured", "failed", "refunded"]
 OrderStatus = Literal[
     "received",
@@ -61,7 +65,7 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
 DEV_STAFF_PINS: dict[str, str] = {
     "brentford-fc": "8888",
 }
-STAFF_TOKENS: dict[str, dict[str, str]] = {}
+STAFF_TOKENS: dict[str, dict[str, object]] = {}
 ACTIVE_CUSTOMER_ORDER_STATUSES = (
     "received",
     "accepted",
@@ -73,6 +77,67 @@ ACTIVE_CUSTOMER_ORDER_STATUSES = (
     "arrived",
 )
 ACTIVE_RUNNER_ORDER_STATUSES = ("assigned", "loaded", "en_route", "arrived")
+DEFAULT_MENU_ITEMS: dict[str, list[dict[str, object]]] = {
+    "brentford-fc": [
+        {
+            "item_id": "bf-lager",
+            "item_name": "House Lager Pint",
+            "category": "Beer",
+            "price_text": "PS6.80",
+            "available_modes": ["Seat Delivery", "Nearest Point", "Click & Collect"],
+            "sort_order": 10,
+        },
+        {
+            "item_id": "bf-cider",
+            "item_name": "Dry Cider Pint",
+            "category": "Beer",
+            "price_text": "PS6.60",
+            "available_modes": ["Seat Delivery", "Nearest Point", "Click & Collect"],
+            "sort_order": 20,
+        },
+        {
+            "item_id": "bf-gintonic",
+            "item_name": "Gin & Tonic",
+            "category": "Spirits",
+            "price_text": "PS8.20",
+            "available_modes": ["Seat Delivery", "Nearest Point", "Click & Collect"],
+            "sort_order": 30,
+        },
+        {
+            "item_id": "bf-soft",
+            "item_name": "Soft Drink 500ml",
+            "category": "Soft Drinks",
+            "price_text": "PS3.00",
+            "available_modes": ["Seat Delivery", "Nearest Point", "Click & Collect"],
+            "sort_order": 40,
+        },
+        {
+            "item_id": "bf-water",
+            "item_name": "Water 500ml",
+            "category": "Soft Drinks",
+            "price_text": "PS2.20",
+            "available_modes": ["Seat Delivery", "Nearest Point", "Click & Collect"],
+            "sort_order": 50,
+        },
+    ]
+}
+DEFAULT_VENUE_RECORDS: dict[str, dict[str, str]] = {
+    "brentford-fc": {
+        "name": "Brentford FC - Gtech Community Stadium",
+    }
+}
+DEFAULT_VENDOR_RECORDS: dict[str, list[dict[str, str]]] = {
+    "brentford-fc": [
+        {
+            "slug": "50pints",
+            "name": "50Pints",
+        },
+        {
+            "slug": "vibe-coding-sux",
+            "name": "Vibe coding sux",
+        },
+    ]
+}
 
 
 class RegisterRequest(BaseModel):
@@ -87,6 +152,12 @@ class CustomerProfileRequest(BaseModel):
     email: str
     delivery_mode: str
     delivery_target: str
+
+
+class CustomerUpgradeRequest(BaseModel):
+    venue_slug: str
+    email: str
+    password: str
 
 
 class OrderItem(BaseModel):
@@ -105,6 +176,11 @@ class CreateOrderRequest(BaseModel):
     items: list[OrderItem]
     checkout_type: Literal["guest", "remembered"] = "guest"
     customer_token: str | None = None
+    tip_amount_pennies: int = 0
+
+
+class AddTipRequest(BaseModel):
+    tip_amount_pennies: int
 
 
 class UpdateOrderStatusRequest(BaseModel):
@@ -114,11 +190,26 @@ class UpdateOrderStatusRequest(BaseModel):
 class StaffAuthRequest(BaseModel):
     venue_slug: str
     pin: str
-    role: Literal["runner", "venue", "admin"]
+    role: Literal["runner", "vendor", "venue", "admin"]
+    vendor_slug: str | None = None
 
 
 class CollectVerificationRequest(BaseModel):
     pickup_code: str
+
+
+class MenuItemPayload(BaseModel):
+    venue_slug: str
+    item_id: str
+    item_name: str
+    category: str
+    price_text: str
+    available_modes: list[str]
+    is_active: bool = True
+
+
+class OrderIssueRequest(BaseModel):
+    reason: str | None = None
 
 
 def get_conn() -> sqlite3.Connection:
@@ -140,6 +231,38 @@ def init_db() -> None:
     cur = conn.cursor()
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS venues (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          slug TEXT NOT NULL UNIQUE,
+          name TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vendors (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          venue_id INTEGER NOT NULL,
+          slug TEXT NOT NULL,
+          name TEXT NOT NULL,
+          is_default INTEGER NOT NULL DEFAULT 0,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY (venue_id) REFERENCES venues(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_vendors_venue_slug
+        ON vendors (venue_id, slug)
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS mailing_list (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           name TEXT NOT NULL,
@@ -158,9 +281,12 @@ def init_db() -> None:
           email TEXT NOT NULL,
           default_delivery_mode TEXT NOT NULL,
           default_delivery_target TEXT NOT NULL,
+          preferred_delivery_mode TEXT,
+          preferred_delivery_target TEXT,
           preferred_payment_method TEXT,
           profile_token TEXT NOT NULL UNIQUE,
           account_level TEXT NOT NULL DEFAULT 'profile',
+          password_hash TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           last_order_at TEXT
@@ -169,8 +295,51 @@ def init_db() -> None:
     )
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS menu_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          venue_slug TEXT NOT NULL,
+          vendor_id INTEGER,
+          item_id TEXT NOT NULL,
+          item_name TEXT NOT NULL,
+          category TEXT NOT NULL,
+          price_text TEXT NOT NULL,
+          available_modes_json TEXT NOT NULL,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          sort_order INTEGER NOT NULL DEFAULT 100,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY (vendor_id) REFERENCES vendors(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_menu_items_venue_item
+        ON menu_items (venue_slug, item_id)
+        """
+    )
+    cur.execute(
+        """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_venue_email
         ON customers (venue_slug, email)
+        """
+    )
+    cur.execute("PRAGMA table_info(customers)")
+    customer_columns = {str(row[1]) for row in cur.fetchall()}
+    if "preferred_delivery_mode" not in customer_columns:
+        cur.execute("ALTER TABLE customers ADD COLUMN preferred_delivery_mode TEXT")
+    if "preferred_delivery_target" not in customer_columns:
+        cur.execute("ALTER TABLE customers ADD COLUMN preferred_delivery_target TEXT")
+    if "password_hash" not in customer_columns:
+        cur.execute("ALTER TABLE customers ADD COLUMN password_hash TEXT")
+    cur.execute("PRAGMA table_info(menu_items)")
+    menu_item_columns = {str(row[1]) for row in cur.fetchall()}
+    if "vendor_id" not in menu_item_columns:
+        cur.execute("ALTER TABLE menu_items ADD COLUMN vendor_id INTEGER")
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_menu_items_vendor_item
+        ON menu_items (vendor_id, item_id)
         """
     )
     cur.execute(
@@ -178,6 +347,8 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS orders (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           venue_slug TEXT NOT NULL,
+          business_day TEXT,
+          display_order_number INTEGER,
           customer_id INTEGER,
           assigned_runner_token TEXT,
           assigned_runner_role TEXT,
@@ -185,7 +356,13 @@ def init_db() -> None:
           ready_for_collection_at TEXT,
           payment_status TEXT NOT NULL DEFAULT 'captured',
           payment_reference TEXT,
+          failure_reason TEXT,
+          failed_at TEXT,
+          refund_reason TEXT,
+          refunded_at TEXT,
           paid_at TEXT,
+          tip_amount_pennies INTEGER NOT NULL DEFAULT 0,
+          tipped_at TEXT,
           customer_name TEXT NOT NULL,
           customer_email TEXT NOT NULL,
           delivery_mode TEXT NOT NULL,
@@ -203,6 +380,10 @@ def init_db() -> None:
     )
     cur.execute("PRAGMA table_info(orders)")
     order_columns = {str(row[1]) for row in cur.fetchall()}
+    if "business_day" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN business_day TEXT")
+    if "display_order_number" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN display_order_number INTEGER")
     if "customer_id" not in order_columns:
         cur.execute("ALTER TABLE orders ADD COLUMN customer_id INTEGER")
     if "assigned_runner_token" not in order_columns:
@@ -217,21 +398,333 @@ def init_db() -> None:
         cur.execute("ALTER TABLE orders ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'captured'")
     if "payment_reference" not in order_columns:
         cur.execute("ALTER TABLE orders ADD COLUMN payment_reference TEXT")
+    if "failure_reason" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN failure_reason TEXT")
+    if "failed_at" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN failed_at TEXT")
+    if "refund_reason" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN refund_reason TEXT")
+    if "refunded_at" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN refunded_at TEXT")
     if "paid_at" not in order_columns:
         cur.execute("ALTER TABLE orders ADD COLUMN paid_at TEXT")
+    if "tip_amount_pennies" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN tip_amount_pennies INTEGER NOT NULL DEFAULT 0")
+    if "tipped_at" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN tipped_at TEXT")
     if "version" not in order_columns:
         cur.execute("ALTER TABLE orders ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
     if "checkout_type" not in order_columns:
         cur.execute("ALTER TABLE orders ADD COLUMN checkout_type TEXT NOT NULL DEFAULT 'guest'")
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_orders_venue_business_day_display
+        ON orders (venue_slug, business_day, display_order_number)
+        """
+    )
+    cur.execute(
+        """
+        SELECT id, venue_slug, created_at
+        FROM orders
+        WHERE business_day IS NULL OR display_order_number IS NULL
+        ORDER BY venue_slug ASC, created_at ASC, id ASC
+        """
+    )
+    legacy_rows = cur.fetchall()
+    display_counters: dict[tuple[str, str], int] = {}
+    for row in legacy_rows:
+        venue_slug = str(row["venue_slug"] or "").strip()
+        business_day = business_day_for_timestamp(str(row["created_at"] or ""))
+        counter_key = (venue_slug, business_day)
+        next_number = display_counters.get(counter_key, 0) + 1
+        display_counters[counter_key] = min(next_number, MAX_DAILY_DISPLAY_ORDER_NUMBER)
+        cur.execute(
+            """
+            UPDATE orders
+            SET business_day = COALESCE(business_day, ?),
+                display_order_number = COALESCE(display_order_number, ?)
+            WHERE id = ?
+            """,
+            (business_day, display_counters[counter_key], int(row["id"])),
+        )
+    now = datetime.now(timezone.utc).isoformat()
+    known_venue_slugs = set(DEFAULT_VENUE_RECORDS) | set(DEFAULT_MENU_ITEMS)
+    cur.execute("SELECT DISTINCT venue_slug FROM menu_items")
+    known_venue_slugs.update(str(row["venue_slug"] or "").strip() for row in cur.fetchall())
+    cur.execute("SELECT DISTINCT venue_slug FROM orders")
+    known_venue_slugs.update(str(row["venue_slug"] or "").strip() for row in cur.fetchall())
+    cur.execute("SELECT DISTINCT venue_slug FROM customers")
+    known_venue_slugs.update(str(row["venue_slug"] or "").strip() for row in cur.fetchall())
+    known_venue_slugs = {slug for slug in known_venue_slugs if slug}
+    for venue_slug in sorted(known_venue_slugs):
+        venue_defaults = DEFAULT_VENUE_RECORDS.get(venue_slug, {})
+        venue_name = venue_defaults.get("name", venue_slug.replace("-", " ").title())
+        cur.execute(
+            """
+            INSERT INTO venues (slug, name, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(slug) DO UPDATE SET
+              name = excluded.name,
+              updated_at = excluded.updated_at
+            """,
+            (venue_slug, venue_name, now, now),
+        )
+    for venue_slug in sorted(known_venue_slugs):
+        vendor_defaults = DEFAULT_VENDOR_RECORDS.get(
+            venue_slug,
+            [
+                {
+                    "slug": f"{venue_slug}-vendor",
+                    "name": f"{venue_slug.replace('-', ' ').title()} Vendor",
+                }
+            ],
+        )
+        cur.execute("SELECT id FROM venues WHERE slug = ?", (venue_slug,))
+        venue_row = cur.fetchone()
+        if venue_row is None:
+            continue
+        venue_id = int(venue_row["id"])
+        for vendor_default in vendor_defaults:
+            cur.execute(
+                """
+                INSERT INTO vendors (venue_id, slug, name, is_default, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, 0, 1, ?, ?)
+                ON CONFLICT(venue_id, slug) DO UPDATE SET
+                  name = excluded.name,
+                  is_active = 1,
+                  updated_at = excluded.updated_at
+                """,
+                (venue_id, vendor_default["slug"], vendor_default["name"], now, now),
+            )
+        if venue_slug in DEFAULT_VENDOR_RECORDS:
+            seeded_slugs = [vendor_default["slug"] for vendor_default in vendor_defaults]
+            placeholders = ", ".join("?" for _ in seeded_slugs)
+            cur.execute(
+                f"""
+                UPDATE vendors
+                SET is_active = CASE WHEN slug IN ({placeholders}) THEN 1 ELSE 0 END,
+                    is_default = 0,
+                    updated_at = ?
+                WHERE venue_id = ?
+                """,
+                (*seeded_slugs, now, venue_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE vendors SET is_default = 0, updated_at = ? WHERE venue_id = ?",
+                (now, venue_id),
+            )
+    cur.execute(
+        """
+        SELECT mi.id, mi.venue_slug
+        FROM menu_items mi
+        WHERE mi.vendor_id IS NULL
+        """
+    )
+    for row in cur.fetchall():
+        cur.execute(
+            """
+            SELECT v.id
+            FROM vendors v
+            JOIN venues ve ON ve.id = v.venue_id
+            WHERE ve.slug = ?
+            ORDER BY v.slug ASC, v.id ASC
+            LIMIT 1
+            """,
+            (str(row["venue_slug"]),),
+        )
+        vendor_row = cur.fetchone()
+        if vendor_row is not None:
+            cur.execute("UPDATE menu_items SET vendor_id = ? WHERE id = ?", (int(vendor_row["id"]), int(row["id"])))
+    for venue_slug, items in DEFAULT_MENU_ITEMS.items():
+        cur.execute("SELECT COUNT(*) FROM menu_items WHERE venue_slug = ?", (venue_slug,))
+        existing_count = int(cur.fetchone()[0] or 0)
+        if existing_count > 0:
+            continue
+        seeded_vendor_slugs = [vendor_default["slug"] for vendor_default in DEFAULT_VENDOR_RECORDS.get(venue_slug, [])]
+        if seeded_vendor_slugs:
+            placeholders = ", ".join("?" for _ in seeded_vendor_slugs)
+            cur.execute(
+                f"""
+                SELECT v.id
+                FROM vendors v
+                JOIN venues ve ON ve.id = v.venue_id
+                WHERE ve.slug = ? AND v.slug IN ({placeholders}) AND v.is_active = 1
+                ORDER BY v.slug ASC, v.id ASC
+                """,
+                (venue_slug, *seeded_vendor_slugs),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT v.id
+                FROM vendors v
+                JOIN venues ve ON ve.id = v.venue_id
+                WHERE ve.slug = ? AND v.is_active = 1
+                ORDER BY v.slug ASC, v.id ASC
+                """,
+                (venue_slug,),
+            )
+        venue_vendor_ids = [int(vendor_row["id"]) for vendor_row in cur.fetchall()]
+        for item in items:
+            cur.execute(
+                """
+                INSERT INTO menu_items (
+                  venue_slug, vendor_id, item_id, item_name, category, price_text,
+                  available_modes_json, is_active, sort_order, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    venue_slug,
+                    venue_vendor_ids[(int(item["sort_order"]) // 10 - 1) % len(venue_vendor_ids)] if venue_vendor_ids else None,
+                    str(item["item_id"]),
+                    str(item["item_name"]),
+                    str(item["category"]),
+                    str(item["price_text"]),
+                    json.dumps(item["available_modes"]),
+                    int(item["sort_order"]),
+                    now,
+                    now,
+                ),
+            )
+    for venue_slug, vendor_defaults in DEFAULT_VENDOR_RECORDS.items():
+        if len(vendor_defaults) < 2:
+            continue
+        cur.execute(
+            """
+            SELECT mi.id
+            FROM menu_items mi
+            WHERE mi.venue_slug = ?
+            ORDER BY mi.sort_order ASC, mi.item_name ASC, mi.id ASC
+            """,
+            (venue_slug,),
+        )
+        item_rows = cur.fetchall()
+        seeded_vendor_slugs = [vendor_default["slug"] for vendor_default in vendor_defaults]
+        placeholders = ", ".join("?" for _ in seeded_vendor_slugs)
+        cur.execute(
+            f"""
+            SELECT v.id
+            FROM vendors v
+            JOIN venues ve ON ve.id = v.venue_id
+            WHERE ve.slug = ? AND v.slug IN ({placeholders}) AND v.is_active = 1
+            ORDER BY v.slug ASC, v.id ASC
+            """,
+            (venue_slug, *seeded_vendor_slugs),
+        )
+        vendor_rows = cur.fetchall()
+        vendor_ids = [int(vendor_row["id"]) for vendor_row in vendor_rows]
+        if len(vendor_ids) < 2:
+            continue
+        cur.execute(
+            f"""
+            SELECT COUNT(DISTINCT vendor_id) AS seeded_vendor_count
+            FROM menu_items
+            WHERE venue_slug = ? AND vendor_id IN ({placeholders})
+            """,
+            (venue_slug, *vendor_ids),
+        )
+        seeded_vendor_count = int(cur.fetchone()["seeded_vendor_count"] or 0)
+        other_placeholders = ", ".join("?" for _ in vendor_ids)
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS other_vendor_items
+            FROM menu_items
+            WHERE venue_slug = ? AND (vendor_id IS NULL OR vendor_id NOT IN ({other_placeholders}))
+            """,
+            (venue_slug, *vendor_ids),
+        )
+        other_vendor_items = int(cur.fetchone()["other_vendor_items"] or 0)
+        if seeded_vendor_count == len(vendor_ids) and other_vendor_items == 0:
+            continue
+        for index, item_row in enumerate(item_rows):
+            cur.execute(
+                "UPDATE menu_items SET vendor_id = ? WHERE id = ?",
+                (vendor_ids[index % len(vendor_ids)], int(item_row["id"])),
+            )
     conn.commit()
     conn.close()
+
+
+def read_venue_row(cur: sqlite3.Cursor, venue_slug: str) -> sqlite3.Row | None:
+    cur.execute(
+        """
+        SELECT id, slug, name, created_at, updated_at
+        FROM venues
+        WHERE slug = ?
+        """,
+        (venue_slug.strip(),),
+    )
+    return cur.fetchone()
+
+
+def read_first_vendor_row(cur: sqlite3.Cursor, venue_slug: str) -> sqlite3.Row | None:
+    cur.execute(
+        """
+        SELECT v.id, v.slug, v.name, v.venue_id, v.is_default, v.is_active
+        FROM vendors v
+        JOIN venues ve ON ve.id = v.venue_id
+        WHERE ve.slug = ? AND v.is_active = 1
+        ORDER BY v.slug ASC, v.id ASC
+        LIMIT 1
+        """,
+        (venue_slug.strip(),),
+    )
+    return cur.fetchone()
+
+
+def read_vendor_by_slug(cur: sqlite3.Cursor, venue_slug: str, vendor_slug: str) -> sqlite3.Row | None:
+    cur.execute(
+        """
+        SELECT v.id, v.slug, v.name, v.venue_id, v.is_default, v.is_active
+        FROM vendors v
+        JOIN venues ve ON ve.id = v.venue_id
+        WHERE ve.slug = ? AND v.slug = ?
+        LIMIT 1
+        """,
+        (venue_slug.strip(), vendor_slug.strip()),
+    )
+    return cur.fetchone()
+
+
+def business_day_for_timestamp(raw_timestamp: str) -> str:
+    if raw_timestamp:
+        try:
+            parsed = datetime.fromisoformat(raw_timestamp)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(VENUE_TIMEZONE).date().isoformat()
+        except ValueError:
+            pass
+    return datetime.now(VENUE_TIMEZONE).date().isoformat()
+
+
+def allocate_display_order_number(cur: sqlite3.Cursor, *, venue_slug: str, business_day: str) -> int:
+    cur.execute(
+        """
+        SELECT COALESCE(MAX(display_order_number), 0)
+        FROM orders
+        WHERE venue_slug = ? AND business_day = ?
+        """,
+        (venue_slug, business_day),
+    )
+    next_number = int(cur.fetchone()[0] or 0) + 1
+    if next_number > MAX_DAILY_DISPLAY_ORDER_NUMBER:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Daily display order number limit reached for {business_day}.",
+        )
+    return next_number
 
 
 def read_order_row(cur: sqlite3.Cursor, order_id: int) -> sqlite3.Row:
     cur.execute(
         """
-        SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
-               pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
+        SELECT id, venue_slug, business_day, display_order_number,
+               customer_id, assigned_runner_token, assigned_runner_role,
+               pickup_code, ready_for_collection_at, payment_status, payment_reference,
+               failure_reason, failed_at, refund_reason, refunded_at, paid_at,
+               tip_amount_pennies, tipped_at,
                customer_name, customer_email, delivery_mode, delivery_target,
                items_json, version, checkout_type, status, eta_text, created_at, updated_at
         FROM orders
@@ -249,8 +742,11 @@ def read_active_customer_order_row(cur: sqlite3.Cursor, *, venue_slug: str, cust
     status_placeholders = ", ".join("?" for _ in ACTIVE_CUSTOMER_ORDER_STATUSES)
     cur.execute(
         f"""
-        SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
-               pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
+        SELECT id, venue_slug, business_day, display_order_number,
+               customer_id, assigned_runner_token, assigned_runner_role,
+               pickup_code, ready_for_collection_at, payment_status, payment_reference,
+               failure_reason, failed_at, refund_reason, refunded_at, paid_at,
+               tip_amount_pennies, tipped_at,
                customer_name, customer_email, delivery_mode, delivery_target,
                items_json, version, checkout_type, status, eta_text, created_at, updated_at
         FROM orders
@@ -267,8 +763,11 @@ def read_active_runner_order_row(cur: sqlite3.Cursor, *, venue_slug: str, runner
     status_placeholders = ", ".join("?" for _ in ACTIVE_RUNNER_ORDER_STATUSES)
     cur.execute(
         f"""
-        SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
-               pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
+        SELECT id, venue_slug, business_day, display_order_number,
+               customer_id, assigned_runner_token, assigned_runner_role,
+               pickup_code, ready_for_collection_at, payment_status, payment_reference,
+               failure_reason, failed_at, refund_reason, refunded_at, paid_at,
+               tip_amount_pennies, tipped_at,
                customer_name, customer_email, delivery_mode, delivery_target,
                items_json, version, checkout_type, status, eta_text, created_at, updated_at
         FROM orders
@@ -284,6 +783,8 @@ def read_active_runner_order_row(cur: sqlite3.Cursor, *, venue_slug: str, runner
 def serialize_order_row(row: sqlite3.Row) -> dict[str, object]:
     return {
         "order_id": row["id"],
+        "business_day": row["business_day"],
+        "display_order_number": int(row["display_order_number"] or row["id"]),
         "venue_slug": row["venue_slug"],
         "customer_id": row["customer_id"],
         "assigned_runner_token": row["assigned_runner_token"],
@@ -292,7 +793,14 @@ def serialize_order_row(row: sqlite3.Row) -> dict[str, object]:
         "ready_for_collection_at": row["ready_for_collection_at"],
         "payment_status": row["payment_status"],
         "payment_reference": row["payment_reference"],
+        "failure_reason": row["failure_reason"],
+        "failed_at": row["failed_at"],
+        "refund_reason": row["refund_reason"],
+        "refunded_at": row["refunded_at"],
         "paid_at": row["paid_at"],
+        "tip_amount_pennies": int(row["tip_amount_pennies"] or 0),
+        "tipped_at": row["tipped_at"],
+        "has_tip": int(row["tip_amount_pennies"] or 0) > 0,
         "customer_name": row["customer_name"],
         "customer_email": row["customer_email"],
         "delivery_mode": row["delivery_mode"],
@@ -307,8 +815,55 @@ def serialize_order_row(row: sqlite3.Row) -> dict[str, object]:
     }
 
 
+def serialize_menu_item_row(row: sqlite3.Row) -> dict[str, object]:
+    row_keys = set(row.keys())
+    return {
+        "venue_slug": row["venue_slug"],
+        "vendor_id": int(row["vendor_id"]) if "vendor_id" in row_keys and row["vendor_id"] is not None else None,
+        "vendor_slug": row["vendor_slug"] if "vendor_slug" in row_keys else None,
+        "vendor_name": row["vendor_name"] if "vendor_name" in row_keys else None,
+        "item_id": row["item_id"],
+        "item_name": row["item_name"],
+        "category": row["category"],
+        "price_text": row["price_text"],
+        "available_modes": json.loads(row["available_modes_json"]),
+        "is_active": bool(row["is_active"]),
+        "sort_order": int(row["sort_order"] or 0),
+        "updated_at": row["updated_at"],
+    }
+
+
 def is_click_and_collect_mode(delivery_mode: str) -> bool:
     return delivery_mode.strip().lower() == "click & collect"
+
+
+def normalize_tip_amount_pennies(amount: int) -> int:
+    normalized = int(amount or 0)
+    if normalized < 0:
+        raise HTTPException(status_code=400, detail="Tip amount cannot be negative.")
+    if normalized > 5000:
+        raise HTTPException(status_code=400, detail="Tip amount is too large for this prototype.")
+    return normalized
+
+
+def add_tip_to_order(cur: sqlite3.Cursor, order_id: int, tip_amount_pennies: int) -> dict[str, object]:
+    row = read_order_row(cur, order_id)
+    if int(row["tip_amount_pennies"] or 0) > 0:
+        raise HTTPException(status_code=409, detail="Tip already recorded for this order.")
+    normalized_tip = normalize_tip_amount_pennies(tip_amount_pennies)
+    if normalized_tip == 0:
+        raise HTTPException(status_code=400, detail="Tip amount must be greater than zero.")
+    tipped_at = datetime.now(timezone.utc).isoformat()
+    cur.execute(
+        """
+        UPDATE orders
+        SET tip_amount_pennies = ?, tipped_at = ?, updated_at = ?, version = COALESCE(version, 1) + 1
+        WHERE id = ?
+        """,
+        (normalized_tip, tipped_at, tipped_at, order_id),
+    )
+    updated = read_order_row(cur, order_id)
+    return serialize_order_row(updated)
 
 
 def make_pickup_code() -> str:
@@ -400,14 +955,28 @@ def make_profile_token() -> str:
     return secrets.token_urlsafe(24)
 
 
+def hash_member_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt.encode("utf-8"), n=2**14, r=8, p=1).hex()
+    return f"{salt}:{digest}"
+
+
 def serialize_customer_profile(row: sqlite3.Row) -> dict[str, str | int | None]:
+    preferred_delivery_mode = row["preferred_delivery_mode"]
+    preferred_delivery_target = row["preferred_delivery_target"]
+    last_delivery_mode = row["default_delivery_mode"]
+    last_delivery_target = row["default_delivery_target"]
     return {
         "customer_id": row["id"],
         "venue_slug": row["venue_slug"],
         "name": row["name"],
         "email": row["email"],
-        "delivery_mode": row["default_delivery_mode"],
-        "delivery_target": row["default_delivery_target"],
+        "delivery_mode": preferred_delivery_mode or last_delivery_mode,
+        "delivery_target": preferred_delivery_target or last_delivery_target,
+        "preferred_delivery_mode": preferred_delivery_mode,
+        "preferred_delivery_target": preferred_delivery_target,
+        "last_delivery_mode": last_delivery_mode,
+        "last_delivery_target": last_delivery_target,
         "preferred_payment_method": row["preferred_payment_method"],
         "account_level": row["account_level"],
         "customer_token": row["profile_token"],
@@ -420,15 +989,82 @@ def get_staff_token(authorization: str | None, *, venue_slug: str, allowed_roles
     return token, token_record
 
 
+def resolve_vendor_for_staff_login(cur: sqlite3.Cursor, venue_slug: str, vendor_slug: str | None = None) -> sqlite3.Row:
+    vendor_row = (
+        read_vendor_by_slug(cur, venue_slug, vendor_slug)
+        if vendor_slug and vendor_slug.strip()
+        else read_first_vendor_row(cur, venue_slug)
+    )
+    if vendor_row is None:
+        raise HTTPException(status_code=404, detail="Vendor not found for this venue.")
+    if not bool(vendor_row["is_active"]):
+        raise HTTPException(status_code=403, detail="Vendor is inactive.")
+    return vendor_row
+
+
+def get_vendor_token_scope(
+    token_record: dict[str, object],
+    *,
+    allow_admin: bool = False,
+) -> int | None:
+    role = str(token_record.get("role") or "")
+    if role == "admin" and allow_admin:
+        return None
+    if role != "vendor":
+        raise HTTPException(status_code=403, detail="Vendor scope required.")
+    vendor_id = token_record.get("vendor_id")
+    if vendor_id is None:
+        raise HTTPException(status_code=403, detail="Vendor token is missing vendor scope.")
+    return int(vendor_id)
+
+
+def order_is_owned_by_vendor(cur: sqlite3.Cursor, order_row: sqlite3.Row, vendor_id: int) -> bool:
+    try:
+        order_items = json.loads(order_row["items_json"])
+    except (TypeError, ValueError):
+        return False
+    item_ids = sorted({str(item.get("item_id") or "").strip() for item in order_items if str(item.get("item_id") or "").strip()})
+    if not item_ids:
+        return False
+    placeholders = ", ".join("?" for _ in item_ids)
+    cur.execute(
+        f"""
+        SELECT item_id, vendor_id
+        FROM menu_items
+        WHERE venue_slug = ? AND item_id IN ({placeholders}) AND vendor_id IS NOT NULL
+        """,
+        (str(order_row["venue_slug"]), *item_ids),
+    )
+    owners = {str(row["item_id"]): int(row["vendor_id"]) for row in cur.fetchall()}
+    if len(owners) != len(item_ids):
+        return False
+    return set(owners.values()) == {vendor_id}
+
+
 def read_customer_by_token(cur: sqlite3.Cursor, venue_slug: str, token: str) -> sqlite3.Row | None:
     cur.execute(
         """
         SELECT id, venue_slug, name, email, default_delivery_mode, default_delivery_target,
+               preferred_delivery_mode, preferred_delivery_target,
                preferred_payment_method, profile_token, account_level, created_at, updated_at, last_order_at
         FROM customers
         WHERE venue_slug = ? AND profile_token = ?
         """,
         (venue_slug, token),
+    )
+    return cur.fetchone()
+
+
+def read_customer_by_email(cur: sqlite3.Cursor, venue_slug: str, email: str) -> sqlite3.Row | None:
+    cur.execute(
+        """
+        SELECT id, venue_slug, name, email, default_delivery_mode, default_delivery_target,
+               preferred_delivery_mode, preferred_delivery_target,
+               preferred_payment_method, profile_token, account_level, created_at, updated_at, last_order_at
+        FROM customers
+        WHERE venue_slug = ? AND email = ?
+        """,
+        (venue_slug, email.strip().lower()),
     )
     return cur.fetchone()
 
@@ -455,16 +1091,7 @@ def upsert_customer_profile(
         existing = read_customer_by_token(cur, normalized_venue_slug, customer_token.strip())
 
     if existing is None:
-        cur.execute(
-            """
-            SELECT id, venue_slug, name, email, default_delivery_mode, default_delivery_target,
-                   preferred_payment_method, profile_token, account_level, created_at, updated_at, last_order_at
-            FROM customers
-            WHERE venue_slug = ? AND email = ?
-            """,
-            (normalized_venue_slug, normalized_email),
-        )
-        existing = cur.fetchone()
+        existing = read_customer_by_email(cur, normalized_venue_slug, normalized_email)
 
     if existing is None:
         token = customer_token.strip() if customer_token else make_profile_token()
@@ -514,6 +1141,7 @@ def upsert_customer_profile(
     cur.execute(
         """
         SELECT id, venue_slug, name, email, default_delivery_mode, default_delivery_target,
+               preferred_delivery_mode, preferred_delivery_target,
                preferred_payment_method, profile_token, account_level, created_at, updated_at, last_order_at
         FROM customers
         WHERE id = ?
@@ -531,7 +1159,8 @@ def require_staff_token(
     *,
     venue_slug: str | None = None,
     allowed_roles: set[str] | None = None,
-) -> dict[str, str]:
+    vendor_id: int | None = None,
+) -> dict[str, object]:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid authorization token.")
     token = authorization.split(" ", 1)[1].strip()
@@ -544,6 +1173,11 @@ def require_staff_token(
 
     if allowed_roles and token_record["role"] not in allowed_roles:
         raise HTTPException(status_code=403, detail="Role does not have permission.")
+
+    if vendor_id is not None and token_record["role"] == "vendor":
+        token_vendor_id = token_record.get("vendor_id")
+        if token_vendor_id is None or int(token_vendor_id) != vendor_id:
+            raise HTTPException(status_code=403, detail="Token does not match vendor.")
     return token_record
 
 
@@ -558,18 +1192,28 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/staff/auth")
-def staff_auth(payload: StaffAuthRequest) -> dict[str, str]:
+def staff_auth(payload: StaffAuthRequest) -> dict[str, object]:
     expected_pin = DEV_STAFF_PINS.get(payload.venue_slug.strip())
     if expected_pin is None or payload.pin.strip() != expected_pin:
         raise HTTPException(status_code=401, detail="Invalid staff PIN.")
 
-    token = secrets.token_urlsafe(24)
-    STAFF_TOKENS[token] = {
+    token_record: dict[str, object] = {
         "venue_slug": payload.venue_slug.strip(),
         "role": payload.role,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    return {"token": token, "role": payload.role, "venue_slug": payload.venue_slug.strip()}
+    if payload.role == "vendor":
+        conn = get_conn()
+        cur = conn.cursor()
+        vendor_row = resolve_vendor_for_staff_login(cur, payload.venue_slug.strip(), payload.vendor_slug)
+        conn.close()
+        token_record["vendor_id"] = int(vendor_row["id"])
+        token_record["vendor_slug"] = str(vendor_row["slug"])
+        token_record["vendor_name"] = str(vendor_row["name"])
+
+    token = secrets.token_urlsafe(24)
+    STAFF_TOKENS[token] = token_record
+    return {"token": token, **token_record}
 
 
 @app.post("/api/register")
@@ -605,21 +1249,330 @@ def get_customer_profile(
     return serialize_customer_profile(row)
 
 
+@app.get("/api/customers/lookup")
+def lookup_customer(
+    venue_slug: str,
+    email: str,
+) -> dict[str, str | int | bool | None]:
+    conn = get_conn()
+    cur = conn.cursor()
+    row = read_customer_by_email(cur, venue_slug.strip(), email.strip())
+    conn.close()
+    if row is None:
+        return {"exists": False, "venue_slug": venue_slug.strip(), "email": email.strip().lower()}
+    return {
+        "exists": True,
+        "customer_id": row["id"],
+        "venue_slug": row["venue_slug"],
+        "name": row["name"],
+        "email": row["email"],
+        "account_level": row["account_level"],
+    }
+
+
 @app.post("/api/customers/profile")
 def save_customer_profile(payload: CustomerProfileRequest) -> dict[str, object]:
     conn = get_conn()
     cur = conn.cursor()
-    row = upsert_customer_profile(
-        cur,
-        venue_slug=payload.venue_slug,
-        name=payload.name,
-        email=payload.email,
-        delivery_mode=payload.delivery_mode,
-        delivery_target=payload.delivery_target,
+    existing = read_customer_by_email(cur, payload.venue_slug.strip(), payload.email.strip())
+    row = existing
+    if row is None:
+        row = upsert_customer_profile(
+            cur,
+            venue_slug=payload.venue_slug,
+            name=payload.name,
+            email=payload.email,
+            delivery_mode=payload.delivery_mode,
+            delivery_target=payload.delivery_target,
+        )
+    now = datetime.now(timezone.utc).isoformat()
+    cur.execute(
+        """
+        UPDATE customers
+        SET name = ?, email = ?, preferred_delivery_mode = ?, preferred_delivery_target = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            payload.name.strip(),
+            payload.email.strip().lower(),
+            payload.delivery_mode.strip(),
+            payload.delivery_target.strip(),
+            now,
+            int(row["id"]),
+        ),
     )
+    cur.execute(
+        """
+        SELECT id, venue_slug, name, email, default_delivery_mode, default_delivery_target,
+               preferred_delivery_mode, preferred_delivery_target,
+               preferred_payment_method, profile_token, account_level, created_at, updated_at, last_order_at
+        FROM customers
+        WHERE id = ?
+        """,
+        (int(row["id"]),),
+    )
+    row = cur.fetchone()
     conn.commit()
     conn.close()
+    if row is None:
+        raise HTTPException(status_code=500, detail="Could not load updated customer profile.")
     return serialize_customer_profile(row)
+
+
+@app.post("/api/customers/upgrade-account")
+def upgrade_customer_account(payload: CustomerUpgradeRequest) -> dict[str, object]:
+    normalized_venue_slug = payload.venue_slug.strip()
+    normalized_email = payload.email.strip().lower()
+    password = payload.password.strip()
+    if len(password) < 8:
+      raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    row = read_customer_by_email(cur, normalized_venue_slug, normalized_email)
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Customer profile not found.")
+
+    now = datetime.now(timezone.utc).isoformat()
+    cur.execute(
+        """
+        UPDATE customers
+        SET account_level = 'member', password_hash = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (hash_member_password(password), now, int(row["id"])),
+    )
+    cur.execute(
+        """
+        SELECT id, venue_slug, name, email, default_delivery_mode, default_delivery_target,
+               preferred_delivery_mode, preferred_delivery_target,
+               preferred_payment_method, profile_token, account_level, created_at, updated_at, last_order_at
+        FROM customers
+        WHERE id = ?
+        """,
+        (int(row["id"]),),
+    )
+    updated_row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if updated_row is None:
+        raise HTTPException(status_code=500, detail="Could not load upgraded customer profile.")
+    return serialize_customer_profile(updated_row)
+
+
+@app.get("/api/menu")
+def get_menu(
+    venue_slug: str,
+    include_inactive: bool = False,
+    authorization: str | None = Header(default=None),
+) -> dict[str, list[dict[str, object]]]:
+    token_record: dict[str, object] | None = None
+    vendor_scope_id: int | None = None
+    if include_inactive:
+        token_record = require_staff_token(authorization, venue_slug=venue_slug, allowed_roles={"vendor", "admin"})
+        if str(token_record.get("role") or "") == "vendor":
+            vendor_scope_id = get_vendor_token_scope(token_record)
+    conn = get_conn()
+    cur = conn.cursor()
+    if include_inactive:
+        if vendor_scope_id is not None:
+            cur.execute(
+                """
+                SELECT mi.venue_slug, mi.vendor_id, v.slug AS vendor_slug, v.name AS vendor_name,
+                       mi.item_id, mi.item_name, mi.category, mi.price_text, mi.available_modes_json,
+                       mi.is_active, mi.sort_order, mi.updated_at
+                FROM menu_items mi
+                LEFT JOIN vendors v ON v.id = mi.vendor_id
+                WHERE mi.venue_slug = ? AND mi.vendor_id = ?
+                ORDER BY mi.sort_order ASC, mi.item_name ASC
+                """,
+                (venue_slug.strip(), vendor_scope_id),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT mi.venue_slug, mi.vendor_id, v.slug AS vendor_slug, v.name AS vendor_name,
+                       mi.item_id, mi.item_name, mi.category, mi.price_text, mi.available_modes_json,
+                       mi.is_active, mi.sort_order, mi.updated_at
+                FROM menu_items mi
+                LEFT JOIN vendors v ON v.id = mi.vendor_id
+                WHERE mi.venue_slug = ?
+                ORDER BY mi.sort_order ASC, mi.item_name ASC
+                """,
+                (venue_slug.strip(),),
+            )
+    else:
+        cur.execute(
+            """
+            SELECT mi.venue_slug, mi.vendor_id, v.slug AS vendor_slug, v.name AS vendor_name,
+                   mi.item_id, mi.item_name, mi.category, mi.price_text, mi.available_modes_json,
+                   mi.is_active, mi.sort_order, mi.updated_at
+            FROM menu_items mi
+            LEFT JOIN vendors v ON v.id = mi.vendor_id
+            WHERE mi.venue_slug = ? AND mi.is_active = 1
+            ORDER BY mi.sort_order ASC, mi.item_name ASC
+            """,
+            (venue_slug.strip(),),
+        )
+    rows = cur.fetchall()
+    conn.close()
+    return {"items": [serialize_menu_item_row(row) for row in rows]}
+
+
+@app.post("/api/menu/items")
+def create_menu_item(
+    payload: MenuItemPayload,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    token_record = require_staff_token(authorization, venue_slug=payload.venue_slug.strip(), allowed_roles={"vendor", "admin"})
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_conn()
+    cur = conn.cursor()
+    target_vendor = (
+        resolve_vendor_for_staff_login(cur, payload.venue_slug.strip(), str(token_record.get("vendor_slug") or ""))
+        if str(token_record.get("role") or "") == "vendor"
+        else read_first_vendor_row(cur, payload.venue_slug)
+    )
+    if target_vendor is None:
+        conn.close()
+        raise HTTPException(status_code=500, detail="Default vendor is not configured for this venue.")
+    cur.execute(
+        "SELECT COALESCE(MAX(sort_order), 0) FROM menu_items WHERE venue_slug = ? AND vendor_id = ?",
+        (payload.venue_slug.strip(), int(target_vendor["id"])),
+    )
+    next_sort_order = int(cur.fetchone()[0] or 0) + 10
+    cur.execute(
+        """
+        INSERT INTO menu_items (
+          venue_slug, vendor_id, item_id, item_name, category, price_text,
+          available_modes_json, is_active, sort_order, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload.venue_slug.strip(),
+            int(target_vendor["id"]),
+            payload.item_id.strip(),
+            payload.item_name.strip(),
+            payload.category.strip(),
+            payload.price_text.strip(),
+            json.dumps(payload.available_modes),
+            1 if payload.is_active else 0,
+            next_sort_order,
+            now,
+            now,
+        ),
+    )
+    cur.execute(
+        """
+        SELECT mi.venue_slug, mi.vendor_id, v.slug AS vendor_slug, v.name AS vendor_name,
+               mi.item_id, mi.item_name, mi.category, mi.price_text, mi.available_modes_json,
+               mi.is_active, mi.sort_order, mi.updated_at
+        FROM menu_items mi
+        LEFT JOIN vendors v ON v.id = mi.vendor_id
+        WHERE venue_slug = ? AND item_id = ?
+        """,
+        (payload.venue_slug.strip(), payload.item_id.strip()),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    return serialize_menu_item_row(row)
+
+
+@app.put("/api/menu/items/{item_id}")
+def update_menu_item(
+    item_id: str,
+    payload: MenuItemPayload,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    token_record = require_staff_token(authorization, venue_slug=payload.venue_slug.strip(), allowed_roles={"vendor", "admin"})
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_conn()
+    cur = conn.cursor()
+    if str(token_record.get("role") or "") == "vendor":
+        vendor_scope_id = get_vendor_token_scope(token_record)
+        cur.execute(
+            """
+            UPDATE menu_items
+            SET item_name = ?, category = ?, price_text = ?, available_modes_json = ?, is_active = ?, updated_at = ?
+            WHERE venue_slug = ? AND vendor_id = ? AND item_id = ?
+            """,
+            (
+                payload.item_name.strip(),
+                payload.category.strip(),
+                payload.price_text.strip(),
+                json.dumps(payload.available_modes),
+                1 if payload.is_active else 0,
+                now,
+                payload.venue_slug.strip(),
+                vendor_scope_id,
+                item_id.strip(),
+            ),
+        )
+    else:
+        cur.execute(
+            """
+            UPDATE menu_items
+            SET item_name = ?, category = ?, price_text = ?, available_modes_json = ?, is_active = ?, updated_at = ?
+            WHERE venue_slug = ? AND item_id = ?
+            """,
+            (
+                payload.item_name.strip(),
+                payload.category.strip(),
+                payload.price_text.strip(),
+                json.dumps(payload.available_modes),
+                1 if payload.is_active else 0,
+                now,
+                payload.venue_slug.strip(),
+                item_id.strip(),
+            ),
+        )
+    cur.execute(
+        """
+        SELECT mi.venue_slug, mi.vendor_id, v.slug AS vendor_slug, v.name AS vendor_name,
+               mi.item_id, mi.item_name, mi.category, mi.price_text, mi.available_modes_json,
+               mi.is_active, mi.sort_order, mi.updated_at
+        FROM menu_items mi
+        LEFT JOIN vendors v ON v.id = mi.vendor_id
+        WHERE venue_slug = ? AND item_id = ?
+        """,
+        (payload.venue_slug.strip(), item_id.strip()),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Menu item not found.")
+    return serialize_menu_item_row(row)
+
+
+@app.delete("/api/menu/items/{item_id}")
+def delete_menu_item(
+    item_id: str,
+    venue_slug: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, str]:
+    token_record = require_staff_token(authorization, venue_slug=venue_slug.strip(), allowed_roles={"vendor", "admin"})
+    conn = get_conn()
+    cur = conn.cursor()
+    if str(token_record.get("role") or "") == "vendor":
+        vendor_scope_id = get_vendor_token_scope(token_record)
+        cur.execute(
+            "DELETE FROM menu_items WHERE venue_slug = ? AND vendor_id = ? AND item_id = ?",
+            (venue_slug.strip(), vendor_scope_id, item_id.strip()),
+        )
+    else:
+        cur.execute(
+            "DELETE FROM menu_items WHERE venue_slug = ? AND item_id = ?",
+            (venue_slug.strip(), item_id.strip()),
+        )
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    if deleted < 1:
+        raise HTTPException(status_code=404, detail="Menu item not found.")
+    return {"deleted_item_id": item_id.strip(), "venue_slug": venue_slug.strip()}
 
 
 @app.post("/api/orders")
@@ -629,6 +1582,7 @@ async def create_order(request: Request) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Order must contain at least one item.")
 
     now = datetime.now(timezone.utc).isoformat()
+    business_day = business_day_for_timestamp(now)
     payment_status: PaymentStatus = "captured"
     payment_reference = "prototype_checkout"
     normalized_delivery_mode = payload.delivery_mode.strip()
@@ -639,52 +1593,61 @@ async def create_order(request: Request) -> dict[str, object]:
     )
     conn = get_conn()
     cur = conn.cursor()
-    customer_id: int | None = None
-    customer_profile: dict[str, str | int | None] | None = None
-    if payload.checkout_type == "remembered":
-        customer_row = upsert_customer_profile(
-            cur,
-            venue_slug=payload.venue_slug,
-            name=payload.customer_name,
-            email=payload.customer_email,
-            delivery_mode=payload.delivery_mode,
-            delivery_target=payload.delivery_target,
-            customer_token=payload.customer_token,
-        )
-        customer_id = int(customer_row["id"])
-        customer_profile = serialize_customer_profile(customer_row)
-        active_order_row = read_active_customer_order_row(
-            cur,
-            venue_slug=payload.venue_slug.strip(),
-            customer_id=customer_id,
-        )
-        if active_order_row is not None:
-            conn.commit()
-            conn.close()
-            return {
-                "order_id": active_order_row["id"],
-                "status": active_order_row["status"],
-                "eta_text": active_order_row["eta_text"],
-                "checkout_type": active_order_row["checkout_type"],
-                "version": active_order_row["version"],
-                "existing_active_order": True,
-                "customer_profile": customer_profile,
-            }
+    customer_row = upsert_customer_profile(
+        cur,
+        venue_slug=payload.venue_slug,
+        name=payload.customer_name,
+        email=payload.customer_email,
+        delivery_mode=payload.delivery_mode,
+        delivery_target=payload.delivery_target,
+        customer_token=payload.customer_token,
+    )
+    customer_id = int(customer_row["id"])
+    customer_profile = serialize_customer_profile(customer_row)
+    active_order_row = read_active_customer_order_row(
+        cur,
+        venue_slug=payload.venue_slug.strip(),
+        customer_id=customer_id,
+    )
+    if active_order_row is not None:
+        conn.commit()
+        conn.close()
+        return {
+            "order_id": active_order_row["id"],
+            "business_day": active_order_row["business_day"],
+            "display_order_number": int(active_order_row["display_order_number"] or active_order_row["id"]),
+            "status": active_order_row["status"],
+            "eta_text": active_order_row["eta_text"],
+            "checkout_type": active_order_row["checkout_type"],
+            "version": active_order_row["version"],
+            "existing_active_order": True,
+            "customer_profile": customer_profile,
+        }
 
+    display_order_number = allocate_display_order_number(
+        cur,
+        venue_slug=payload.venue_slug.strip(),
+        business_day=business_day,
+    )
     cur.execute(
         """
         INSERT INTO orders (
-          venue_slug, customer_id, payment_status, payment_reference, paid_at,
+          venue_slug, business_day, display_order_number, customer_id, payment_status, payment_reference, paid_at,
+          tip_amount_pennies, tipped_at,
           customer_name, customer_email, delivery_mode, delivery_target,
           items_json, checkout_type, status, eta_text, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload.venue_slug.strip(),
+            business_day,
+            display_order_number,
             customer_id,
             payment_status,
             payment_reference,
             now,
+            normalize_tip_amount_pennies(payload.tip_amount_pennies),
+            now if normalize_tip_amount_pennies(payload.tip_amount_pennies) > 0 else None,
             payload.customer_name.strip(),
             payload.customer_email.strip().lower(),
             normalized_delivery_mode,
@@ -702,16 +1665,20 @@ async def create_order(request: Request) -> dict[str, object]:
     conn.close()
     response: dict[str, object] = {
         "order_id": order_id,
+        "business_day": business_day,
+        "display_order_number": display_order_number,
         "status": "received",
         "eta_text": eta_text,
         "checkout_type": payload.checkout_type,
         "payment_status": payment_status,
         "payment_reference": payment_reference,
         "paid_at": now,
+        "tip_amount_pennies": normalize_tip_amount_pennies(payload.tip_amount_pennies),
+        "tipped_at": now if normalize_tip_amount_pennies(payload.tip_amount_pennies) > 0 else None,
+        "has_tip": normalize_tip_amount_pennies(payload.tip_amount_pennies) > 0,
         "version": 1,
     }
-    if customer_profile is not None:
-        response["customer_profile"] = customer_profile
+    response["customer_profile"] = customer_profile
     return response
 
 
@@ -766,20 +1733,23 @@ def list_orders(
     limit: int = 100,
     authorization: str | None = Header(default=None),
 ) -> dict[str, list[dict]]:
-    require_staff_token(authorization, venue_slug=venue_slug, allowed_roles={"runner", "venue", "admin"})
+    token_record = require_staff_token(authorization, venue_slug=venue_slug, allowed_roles={"runner", "vendor", "admin"})
     conn = get_conn()
     cur = conn.cursor()
     safe_limit = max(1, min(limit, 200))
     if venue_slug and status:
         cur.execute(
             """
-            SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
-                   pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
-                   customer_name, delivery_mode, delivery_target,
+            SELECT id, venue_slug, business_day, display_order_number,
+                   customer_id, assigned_runner_token, assigned_runner_role,
+                   pickup_code, ready_for_collection_at, payment_status, payment_reference,
+                   failure_reason, failed_at, refund_reason, refunded_at, paid_at,
+                   tip_amount_pennies, tipped_at,
+                   customer_name, delivery_mode, delivery_target, items_json,
                    version, checkout_type, status, eta_text, created_at, updated_at
             FROM orders
             WHERE venue_slug = ? AND status = ?
-            ORDER BY id DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
             (venue_slug, status, safe_limit),
@@ -787,13 +1757,16 @@ def list_orders(
     elif venue_slug:
         cur.execute(
             """
-            SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
-                   pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
-                   customer_name, delivery_mode, delivery_target,
+            SELECT id, venue_slug, business_day, display_order_number,
+                   customer_id, assigned_runner_token, assigned_runner_role,
+                   pickup_code, ready_for_collection_at, payment_status, payment_reference,
+                   failure_reason, failed_at, refund_reason, refunded_at, paid_at,
+                   tip_amount_pennies, tipped_at,
+                   customer_name, delivery_mode, delivery_target, items_json,
                    version, checkout_type, status, eta_text, created_at, updated_at
             FROM orders
             WHERE venue_slug = ?
-            ORDER BY id DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
             (venue_slug, safe_limit),
@@ -801,13 +1774,16 @@ def list_orders(
     elif status:
         cur.execute(
             """
-            SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
-                   pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
-                   customer_name, delivery_mode, delivery_target,
+            SELECT id, venue_slug, business_day, display_order_number,
+                   customer_id, assigned_runner_token, assigned_runner_role,
+                   pickup_code, ready_for_collection_at, payment_status, payment_reference,
+                   failure_reason, failed_at, refund_reason, refunded_at, paid_at,
+                   tip_amount_pennies, tipped_at,
+                   customer_name, delivery_mode, delivery_target, items_json,
                    version, checkout_type, status, eta_text, created_at, updated_at
             FROM orders
             WHERE status = ?
-            ORDER BY id DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
             (status, safe_limit),
@@ -815,22 +1791,30 @@ def list_orders(
     else:
         cur.execute(
             """
-            SELECT id, venue_slug, customer_id, assigned_runner_token, assigned_runner_role,
-                   pickup_code, ready_for_collection_at, payment_status, payment_reference, paid_at,
-                   customer_name, delivery_mode, delivery_target,
+            SELECT id, venue_slug, business_day, display_order_number,
+                   customer_id, assigned_runner_token, assigned_runner_role,
+                   pickup_code, ready_for_collection_at, payment_status, payment_reference,
+                   failure_reason, failed_at, refund_reason, refunded_at, paid_at,
+                   tip_amount_pennies, tipped_at,
+                   customer_name, delivery_mode, delivery_target, items_json,
                    version, checkout_type, status, eta_text, created_at, updated_at
             FROM orders
-            ORDER BY id DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
             (safe_limit,),
         )
     rows = cur.fetchall()
+    if str(token_record.get("role") or "") == "vendor":
+        vendor_scope_id = get_vendor_token_scope(token_record)
+        rows = [row for row in rows if order_is_owned_by_vendor(cur, row, vendor_scope_id)]
     conn.close()
     return {
         "orders": [
             {
                 "order_id": row["id"],
+                "business_day": row["business_day"],
+                "display_order_number": int(row["display_order_number"] or row["id"]),
                 "venue_slug": row["venue_slug"],
                 "customer_id": row["customer_id"],
                 "assigned_runner_token": row["assigned_runner_token"],
@@ -839,10 +1823,18 @@ def list_orders(
                 "ready_for_collection_at": row["ready_for_collection_at"],
                 "payment_status": row["payment_status"],
                 "payment_reference": row["payment_reference"],
+                "failure_reason": row["failure_reason"],
+                "failed_at": row["failed_at"],
+                "refund_reason": row["refund_reason"],
+                "refunded_at": row["refunded_at"],
                 "paid_at": row["paid_at"],
+                "tip_amount_pennies": int(row["tip_amount_pennies"] or 0),
+                "tipped_at": row["tipped_at"],
+                "has_tip": int(row["tip_amount_pennies"] or 0) > 0,
                 "customer_name": row["customer_name"],
                 "delivery_mode": row["delivery_mode"],
                 "delivery_target": row["delivery_target"],
+                "items": json.loads(row["items_json"]),
                 "version": row["version"],
                 "checkout_type": row["checkout_type"],
                 "status": row["status"],
@@ -863,6 +1855,8 @@ def order_status(order_id: int) -> dict:
     conn.close()
     return {
         "order_id": row["id"],
+        "business_day": row["business_day"],
+        "display_order_number": int(row["display_order_number"] or row["id"]),
         "venue_slug": row["venue_slug"],
         "customer_id": row["customer_id"],
         "assigned_runner_token": row["assigned_runner_token"],
@@ -871,7 +1865,14 @@ def order_status(order_id: int) -> dict:
         "ready_for_collection_at": row["ready_for_collection_at"],
         "payment_status": row["payment_status"],
         "payment_reference": row["payment_reference"],
+        "failure_reason": row["failure_reason"],
+        "failed_at": row["failed_at"],
+        "refund_reason": row["refund_reason"],
+        "refunded_at": row["refunded_at"],
         "paid_at": row["paid_at"],
+        "tip_amount_pennies": int(row["tip_amount_pennies"] or 0),
+        "tipped_at": row["tipped_at"],
+        "has_tip": int(row["tip_amount_pennies"] or 0) > 0,
         "customer_name": row["customer_name"],
         "customer_email": row["customer_email"],
         "delivery_mode": row["delivery_mode"],
@@ -894,8 +1895,11 @@ def accept_order(
     conn = get_conn()
     cur = conn.cursor()
     row = read_order_row(cur, order_id)
-    require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"venue", "admin"})
-    result = transition_order_status(cur, order_id, "accepted", actor_role="venue")
+    token_record = require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"vendor", "admin"})
+    if str(token_record.get("role") or "") == "vendor" and not order_is_owned_by_vendor(cur, row, get_vendor_token_scope(token_record)):
+        conn.close()
+        raise HTTPException(status_code=403, detail="Order does not belong to this vendor.")
+    result = transition_order_status(cur, order_id, "accepted", actor_role="vendor")
     conn.commit()
     conn.close()
     return result
@@ -909,8 +1913,11 @@ def reject_order(
     conn = get_conn()
     cur = conn.cursor()
     row = read_order_row(cur, order_id)
-    require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"venue", "admin"})
-    result = transition_order_status(cur, order_id, "rejected", actor_role="venue")
+    token_record = require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"vendor", "admin"})
+    if str(token_record.get("role") or "") == "vendor" and not order_is_owned_by_vendor(cur, row, get_vendor_token_scope(token_record)):
+        conn.close()
+        raise HTTPException(status_code=403, detail="Order does not belong to this vendor.")
+    result = transition_order_status(cur, order_id, "rejected", actor_role="vendor")
     conn.commit()
     conn.close()
     return result
@@ -924,9 +1931,12 @@ def ready_order(
     conn = get_conn()
     cur = conn.cursor()
     row = read_order_row(cur, order_id)
-    require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"venue", "admin"})
+    token_record = require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"vendor", "admin"})
+    if str(token_record.get("role") or "") == "vendor" and not order_is_owned_by_vendor(cur, row, get_vendor_token_scope(token_record)):
+        conn.close()
+        raise HTTPException(status_code=403, detail="Order does not belong to this vendor.")
     target_status: OrderStatus = "ready_for_collection" if is_click_and_collect_mode(str(row["delivery_mode"])) else "ready"
-    result = transition_order_status(cur, order_id, target_status, actor_role="venue")
+    result = transition_order_status(cur, order_id, target_status, actor_role="vendor")
     conn.commit()
     conn.close()
     return result
@@ -941,7 +1951,10 @@ def collect_order(
     conn = get_conn()
     cur = conn.cursor()
     row = read_order_row(cur, order_id)
-    require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"venue", "admin"})
+    token_record = require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"vendor", "admin"})
+    if str(token_record.get("role") or "") == "vendor" and not order_is_owned_by_vendor(cur, row, get_vendor_token_scope(token_record)):
+        conn.close()
+        raise HTTPException(status_code=403, detail="Order does not belong to this vendor.")
     if not is_click_and_collect_mode(str(row["delivery_mode"])):
         conn.close()
         raise HTTPException(status_code=409, detail="Only click and collect orders can be marked collected.")
@@ -949,7 +1962,7 @@ def collect_order(
     if not expected_code or expected_code != payload.pickup_code.strip().upper():
         conn.close()
         raise HTTPException(status_code=400, detail="Pickup code did not match.")
-    result = transition_order_status(cur, order_id, "collected", actor_role="venue")
+    result = transition_order_status(cur, order_id, "collected", actor_role="vendor")
     conn.commit()
     conn.close()
     return result
@@ -963,11 +1976,84 @@ def mark_order_uncollected(
     conn = get_conn()
     cur = conn.cursor()
     row = read_order_row(cur, order_id)
-    require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"venue", "admin"})
+    token_record = require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"vendor", "admin"})
+    if str(token_record.get("role") or "") == "vendor" and not order_is_owned_by_vendor(cur, row, get_vendor_token_scope(token_record)):
+        conn.close()
+        raise HTTPException(status_code=403, detail="Order does not belong to this vendor.")
     if not is_click_and_collect_mode(str(row["delivery_mode"])):
         conn.close()
         raise HTTPException(status_code=409, detail="Only click and collect orders can be marked uncollected.")
-    result = transition_order_status(cur, order_id, "uncollected", actor_role="venue")
+    result = transition_order_status(cur, order_id, "uncollected", actor_role="vendor")
+    conn.commit()
+    conn.close()
+    return result
+
+
+@app.post("/api/orders/{order_id}/fail")
+def fail_order(
+    order_id: int,
+    payload: OrderIssueRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    conn = get_conn()
+    cur = conn.cursor()
+    row = read_order_row(cur, order_id)
+    token_record = require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"vendor", "admin"})
+    if str(token_record.get("role") or "") == "vendor" and not order_is_owned_by_vendor(cur, row, get_vendor_token_scope(token_record)):
+        conn.close()
+        raise HTTPException(status_code=403, detail="Order does not belong to this vendor.")
+    result = transition_order_status(cur, order_id, "failed", actor_role="vendor")
+    failed_at = datetime.now(timezone.utc).isoformat()
+    cur.execute(
+        """
+        UPDATE orders
+        SET failure_reason = ?, failed_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (payload.reason.strip() if payload.reason else None, failed_at, failed_at, order_id),
+    )
+    conn.commit()
+    updated = read_order_row(cur, order_id)
+    conn.close()
+    response = serialize_order_row(updated)
+    response["status_result"] = result
+    return response
+
+
+@app.post("/api/orders/{order_id}/refund")
+def refund_order(
+    order_id: int,
+    payload: OrderIssueRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    conn = get_conn()
+    cur = conn.cursor()
+    row = read_order_row(cur, order_id)
+    require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"admin"})
+    if str(row["payment_status"]) != "captured":
+        conn.close()
+        raise HTTPException(status_code=409, detail="Only captured payments can be refunded in this prototype.")
+    refunded_at = datetime.now(timezone.utc).isoformat()
+    cur.execute(
+        """
+        UPDATE orders
+        SET payment_status = 'refunded', refund_reason = ?, refunded_at = ?, updated_at = ?, version = COALESCE(version, 1) + 1
+        WHERE id = ?
+        """,
+        (payload.reason.strip() if payload.reason else None, refunded_at, refunded_at, order_id),
+    )
+    conn.commit()
+    updated = read_order_row(cur, order_id)
+    conn.close()
+    return serialize_order_row(updated)
+
+
+@app.post("/api/orders/{order_id}/tip")
+async def add_tip(order_id: int, request: Request) -> dict[str, object]:
+    payload = await parse_request_model(request, AddTipRequest)
+    conn = get_conn()
+    cur = conn.cursor()
+    result = add_tip_to_order(cur, order_id, payload.tip_amount_pennies)
     conn.commit()
     conn.close()
     return result
@@ -985,7 +2071,7 @@ def update_order_status(
     actor_token, token_record = get_staff_token(
         authorization,
         venue_slug=str(row["venue_slug"]),
-        allowed_roles={"runner", "venue", "admin"},
+        allowed_roles={"runner", "vendor", "admin"},
     )
     result = transition_order_status(
         cur,

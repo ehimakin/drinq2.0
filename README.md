@@ -1,24 +1,23 @@
 # Drinq 2.0
 
-Unified repository for Drinq's cross-platform app and API.
+Unified repository for Drinq's customer web app, optional ops mobile app, and API.
 
 ## Monorepo Layout
 
-- `apps/mobile` Expo + React Native app (iOS, Android, Web)
+- `apps/web` primary customer-facing web app, also usable for venue and runner operations
+- `apps/mobile` optional Expo ops companion for venue and runner parity work
 - `apps/api` FastAPI backend
-- `apps/web` reserved for dedicated web app (if needed later)
 - `packages/shared` shared types/schemas/utilities
 - `docs` product and architecture notes
 - `scripts` project scripts and legacy utilities
 
 ## Quick Start
 
-### 1) Mobile app (Expo)
+### 1) Customer and staff web app
 
 ```bash
-cd apps/mobile
-npm install
-npm run start
+cd apps/web
+python3 -m http.server 4173
 ```
 
 ### 2) API (FastAPI)
@@ -31,7 +30,22 @@ pip install -r requirements.txt
 uvicorn src.main:app --reload --port 8000
 ```
 
+### 3) Optional mobile ops app
+
+```bash
+cd apps/mobile
+npm install
+npm run start
+```
+
+## Platform Split
+
+- Customer: `apps/web`
+- Venue: `apps/web` first, `apps/mobile` optional
+- Runner: `apps/web` first, `apps/mobile` optional
+
 ## Notes
 
+- Expo web renders the mobile app shell, not the primary customer web experience.
 - Current mobile feature code includes the Pintless waiting game.
 - API includes the matching Pintless endpoints under `/games/pintless/*`.
