@@ -1,0 +1,15 @@
+{
+  "name": "drinq2.0",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "mobile:start": "npm --workspace @drinq/mobile run start",
+    "mobile:web": "npm --workspace @drinq/mobile run web",
+    "mobile:ios": "npm --workspace @drinq/mobile run ios",
+    "mobile:android": "npm --workspace @drinq/mobile run android"
+  }
+}
