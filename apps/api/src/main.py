@@ -46,11 +46,11 @@ OrderStatus = Literal[
 TERMINAL_STATUSES = {"fulfilled", "collected", "uncollected", "rejected", "cancelled", "failed"}
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "received": {"accepted", "rejected", "cancelled"},
-    "accepted": {"ready", "ready_for_collection", "assigned", "cancelled"},
-    "ready": {"assigned", "loaded", "cancelled"},
-    "ready_for_collection": {"collected", "uncollected", "cancelled"},
-    "assigned": {"loaded", "en_route", "cancelled"},
-    "loaded": {"en_route", "arrived", "cancelled"},
+    "accepted": {"ready", "ready_for_collection", "assigned", "cancelled", "failed"},
+    "ready": {"assigned", "loaded", "cancelled", "failed"},
+    "ready_for_collection": {"collected", "uncollected", "cancelled", "failed"},
+    "assigned": {"loaded", "en_route", "cancelled", "failed"},
+    "loaded": {"en_route", "arrived", "cancelled", "failed"},
     "en_route": {"arrived", "failed", "cancelled"},
     "arrived": {"fulfilled", "failed", "cancelled"},
     "collected": set(),
@@ -65,6 +65,12 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
 DEV_STAFF_PINS: dict[str, str] = {
     "brentford-fc": "8888",
 }
+DEV_VENDOR_PINS: dict[str, dict[str, str]] = {
+    "brentford-fc": {
+        "50pints": "8888",
+        "vibe-coding-sux": "9999",
+    }
+}
 STAFF_TOKENS: dict[str, dict[str, object]] = {}
 ACTIVE_CUSTOMER_ORDER_STATUSES = (
     "received",
@@ -77,6 +83,18 @@ ACTIVE_CUSTOMER_ORDER_STATUSES = (
     "arrived",
 )
 ACTIVE_RUNNER_ORDER_STATUSES = ("assigned", "loaded", "en_route", "arrived")
+RUNNER_HEARTBEAT_TIMEOUT_SECONDS = 90
+RUNNER_STALLED_SECONDS_BY_STATUS: dict[str, int] = {
+    "assigned": 180,
+    "loaded": 300,
+    "en_route": 900,
+    "arrived": 300,
+}
+RUNNER_RECOVERY_INCIDENT_CODES = {
+    "runner_assignment_released",
+    "runner_unreachable",
+    "runner_progress_stalled",
+}
 DEFAULT_MENU_ITEMS: dict[str, list[dict[str, object]]] = {
     "brentford-fc": [
         {
@@ -124,6 +142,7 @@ DEFAULT_MENU_ITEMS: dict[str, list[dict[str, object]]] = {
 DEFAULT_VENUE_RECORDS: dict[str, dict[str, str]] = {
     "brentford-fc": {
         "name": "Brentford FC - Gtech Community Stadium",
+        "runner_access_code": "8888",
     }
 }
 DEFAULT_VENDOR_RECORDS: dict[str, list[dict[str, str]]] = {
@@ -194,6 +213,10 @@ class StaffAuthRequest(BaseModel):
     vendor_slug: str | None = None
 
 
+class RunnerAccessRequest(BaseModel):
+    access_code: str
+
+
 class CollectVerificationRequest(BaseModel):
     pickup_code: str
 
@@ -210,6 +233,24 @@ class MenuItemPayload(BaseModel):
 
 class OrderIssueRequest(BaseModel):
     reason: str | None = None
+
+
+class OrderAttentionRequest(BaseModel):
+    reason: str
+
+
+class BugReportRequest(BaseModel):
+    title: str | None = None
+    message: str
+    description: str | None = None
+    source: str | None = None
+    role: str | None = None
+    venue_slug: str | None = None
+    route_name: str | None = None
+    page_url: str | None = None
+    user_agent: str | None = None
+    stack: str | None = None
+    context_json: dict[str, object] | None = None
 
 
 def get_conn() -> sqlite3.Connection:
@@ -235,9 +276,20 @@ def init_db() -> None:
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           slug TEXT NOT NULL UNIQUE,
           name TEXT NOT NULL,
+          runner_access_code TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         )
+        """
+    )
+    cur.execute("PRAGMA table_info(venues)")
+    venue_columns = {str(row[1]) for row in cur.fetchall()}
+    if "runner_access_code" not in venue_columns:
+        cur.execute("ALTER TABLE venues ADD COLUMN runner_access_code TEXT")
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_venues_runner_access_code
+        ON venues (runner_access_code)
         """
     )
     cur.execute(
@@ -352,6 +404,9 @@ def init_db() -> None:
           customer_id INTEGER,
           assigned_runner_token TEXT,
           assigned_runner_role TEXT,
+          assignment_started_at TEXT,
+          last_runner_heartbeat_at TEXT,
+          status_updated_at TEXT,
           pickup_code TEXT,
           ready_for_collection_at TEXT,
           payment_status TEXT NOT NULL DEFAULT 'captured',
@@ -390,6 +445,12 @@ def init_db() -> None:
         cur.execute("ALTER TABLE orders ADD COLUMN assigned_runner_token TEXT")
     if "assigned_runner_role" not in order_columns:
         cur.execute("ALTER TABLE orders ADD COLUMN assigned_runner_role TEXT")
+    if "assignment_started_at" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN assignment_started_at TEXT")
+    if "last_runner_heartbeat_at" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN last_runner_heartbeat_at TEXT")
+    if "status_updated_at" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN status_updated_at TEXT")
     if "pickup_code" not in order_columns:
         cur.execute("ALTER TABLE orders ADD COLUMN pickup_code TEXT")
     if "ready_for_collection_at" not in order_columns:
@@ -416,6 +477,74 @@ def init_db() -> None:
         cur.execute("ALTER TABLE orders ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
     if "checkout_type" not in order_columns:
         cur.execute("ALTER TABLE orders ADD COLUMN checkout_type TEXT NOT NULL DEFAULT 'guest'")
+    cur.execute(
+        """
+        UPDATE orders
+        SET status_updated_at = COALESCE(status_updated_at, updated_at, created_at)
+        WHERE status_updated_at IS NULL
+        """
+    )
+    cur.execute(
+        """
+        UPDATE orders
+        SET assignment_started_at = COALESCE(assignment_started_at, status_updated_at, updated_at, created_at)
+        WHERE assignment_started_at IS NULL AND assigned_runner_token IS NOT NULL
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS order_incidents (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_id INTEGER NOT NULL,
+          venue_slug TEXT NOT NULL,
+          code TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          detail TEXT,
+          auto_detected INTEGER NOT NULL DEFAULT 1,
+          opened_by_role TEXT,
+          resolved_by_role TEXT,
+          status TEXT NOT NULL DEFAULT 'open',
+          detected_at TEXT NOT NULL,
+          last_observed_at TEXT NOT NULL,
+          resolved_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY (order_id) REFERENCES orders(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_order_incidents_order_status
+        ON order_incidents (order_id, status, code)
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bug_reports (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT,
+          message TEXT NOT NULL,
+          description TEXT,
+          source TEXT,
+          role TEXT,
+          venue_slug TEXT,
+          route_name TEXT,
+          page_url TEXT,
+          user_agent TEXT,
+          stack TEXT,
+          context_json TEXT,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_bug_reports_created_at
+        ON bug_reports (created_at DESC)
+        """
+    )
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_orders_venue_business_day_display
@@ -459,15 +588,17 @@ def init_db() -> None:
     for venue_slug in sorted(known_venue_slugs):
         venue_defaults = DEFAULT_VENUE_RECORDS.get(venue_slug, {})
         venue_name = venue_defaults.get("name", venue_slug.replace("-", " ").title())
+        runner_access_code = venue_defaults.get("runner_access_code")
         cur.execute(
             """
-            INSERT INTO venues (slug, name, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO venues (slug, name, runner_access_code, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(slug) DO UPDATE SET
               name = excluded.name,
+              runner_access_code = COALESCE(excluded.runner_access_code, venues.runner_access_code),
               updated_at = excluded.updated_at
             """,
-            (venue_slug, venue_name, now, now),
+            (venue_slug, venue_name, runner_access_code, now, now),
         )
     for venue_slug in sorted(known_venue_slugs):
         vendor_defaults = DEFAULT_VENDOR_RECORDS.get(
@@ -649,11 +780,24 @@ def init_db() -> None:
 def read_venue_row(cur: sqlite3.Cursor, venue_slug: str) -> sqlite3.Row | None:
     cur.execute(
         """
-        SELECT id, slug, name, created_at, updated_at
+        SELECT id, slug, name, runner_access_code, created_at, updated_at
         FROM venues
         WHERE slug = ?
         """,
         (venue_slug.strip(),),
+    )
+    return cur.fetchone()
+
+
+def read_venue_by_runner_access_code(cur: sqlite3.Cursor, access_code: str) -> sqlite3.Row | None:
+    cur.execute(
+        """
+        SELECT id, slug, name, runner_access_code, created_at, updated_at
+        FROM venues
+        WHERE runner_access_code = ?
+        LIMIT 1
+        """,
+        (access_code.strip(),),
     )
     return cur.fetchone()
 
@@ -699,6 +843,294 @@ def business_day_for_timestamp(raw_timestamp: str) -> str:
     return datetime.now(VENUE_TIMEZONE).date().isoformat()
 
 
+def parse_iso_timestamp(raw_timestamp: str | None) -> datetime | None:
+    if not raw_timestamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_timestamp)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def touch_order_record(cur: sqlite3.Cursor, order_id: int, *, now_iso: str) -> None:
+    cur.execute(
+        """
+        UPDATE orders
+        SET updated_at = ?, version = COALESCE(version, 1) + 1
+        WHERE id = ?
+        """,
+        (now_iso, order_id),
+    )
+
+
+def read_open_order_incidents(cur: sqlite3.Cursor, order_id: int) -> list[sqlite3.Row]:
+    cur.execute(
+        """
+        SELECT id, order_id, venue_slug, code, severity, summary, detail,
+               auto_detected, opened_by_role, resolved_by_role, status,
+               detected_at, last_observed_at, resolved_at, created_at, updated_at
+        FROM order_incidents
+        WHERE order_id = ? AND status = 'open'
+        ORDER BY
+          CASE severity
+            WHEN 'critical' THEN 0
+            WHEN 'high' THEN 1
+            WHEN 'warning' THEN 2
+            ELSE 3
+          END,
+          id DESC
+        """,
+        (order_id,),
+    )
+    return cur.fetchall()
+
+
+def serialize_incident_row(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "incident_id": int(row["id"]),
+        "code": row["code"],
+        "severity": row["severity"],
+        "summary": row["summary"],
+        "detail": row["detail"],
+        "auto_detected": bool(row["auto_detected"]),
+        "opened_by_role": row["opened_by_role"],
+        "resolved_by_role": row["resolved_by_role"],
+        "status": row["status"],
+        "detected_at": row["detected_at"],
+        "last_observed_at": row["last_observed_at"],
+        "resolved_at": row["resolved_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def open_order_incident(
+    cur: sqlite3.Cursor,
+    order_row: sqlite3.Row,
+    *,
+    code: str,
+    severity: str,
+    summary: str,
+    detail: str | None = None,
+    auto_detected: bool = True,
+    opened_by_role: str | None = None,
+    observed_at: str | None = None,
+) -> bool:
+    observed = observed_at or datetime.now(timezone.utc).isoformat()
+    order_id = int(order_row["id"])
+    cur.execute(
+        """
+        SELECT id, detail
+        FROM order_incidents
+        WHERE order_id = ? AND code = ? AND status = 'open'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (order_id, code),
+    )
+    existing = cur.fetchone()
+    if existing is not None:
+        next_detail = detail if detail is not None else existing["detail"]
+        cur.execute(
+            """
+            UPDATE order_incidents
+            SET detail = ?, last_observed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (next_detail, observed, observed, int(existing["id"])),
+        )
+        return False
+
+    cur.execute(
+        """
+        INSERT INTO order_incidents (
+          order_id, venue_slug, code, severity, summary, detail,
+          auto_detected, opened_by_role, resolved_by_role, status,
+          detected_at, last_observed_at, resolved_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'open', ?, ?, NULL, ?, ?)
+        """,
+        (
+            order_id,
+            str(order_row["venue_slug"]),
+            code,
+            severity,
+            summary,
+            detail,
+            1 if auto_detected else 0,
+            opened_by_role,
+            observed,
+            observed,
+            observed,
+            observed,
+        ),
+    )
+    return True
+
+
+def resolve_order_incidents(
+    cur: sqlite3.Cursor,
+    order_id: int,
+    *,
+    actor_role: str,
+    codes: set[str] | None = None,
+    auto_detected: bool | None = None,
+) -> int:
+    clauses = ["order_id = ?", "status = 'open'"]
+    params: list[object] = [order_id]
+    if codes:
+        placeholders = ", ".join("?" for _ in codes)
+        clauses.append(f"code IN ({placeholders})")
+        params.extend(sorted(codes))
+    if auto_detected is not None:
+        clauses.append("auto_detected = ?")
+        params.append(1 if auto_detected else 0)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cur.execute(
+        f"""
+        UPDATE order_incidents
+        SET status = 'resolved', resolved_by_role = ?, resolved_at = ?, updated_at = ?
+        WHERE {' AND '.join(clauses)}
+        """,
+        (actor_role, now_iso, now_iso, *params),
+    )
+    return int(cur.rowcount or 0)
+
+
+def release_runner_assignment(cur: sqlite3.Cursor, order_id: int, *, now_iso: str) -> None:
+    cur.execute(
+        """
+        UPDATE orders
+        SET assigned_runner_token = NULL,
+            assigned_runner_role = NULL,
+            assignment_started_at = NULL,
+            last_runner_heartbeat_at = NULL,
+            updated_at = ?,
+            version = COALESCE(version, 1) + 1
+        WHERE id = ?
+        """,
+        (now_iso, order_id),
+    )
+
+
+def record_runner_heartbeat(cur: sqlite3.Cursor, order_row: sqlite3.Row, *, runner_token: str) -> sqlite3.Row:
+    if str(order_row["status"] or "") not in ACTIVE_RUNNER_ORDER_STATUSES:
+        return order_row
+    if str(order_row["assigned_runner_token"] or "") != runner_token:
+        return order_row
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cur.execute(
+        """
+        UPDATE orders
+        SET last_runner_heartbeat_at = ?
+        WHERE id = ?
+        """,
+        (now_iso, int(order_row["id"])),
+    )
+    resolved = resolve_order_incidents(
+        cur,
+        int(order_row["id"]),
+        actor_role="system",
+        codes={"runner_unreachable"},
+        auto_detected=True,
+    )
+    if resolved:
+        touch_order_record(cur, int(order_row["id"]), now_iso=now_iso)
+    return read_order_row(cur, int(order_row["id"]))
+
+
+def reconcile_order_operational_health(cur: sqlite3.Cursor, order_row: sqlite3.Row) -> sqlite3.Row:
+    status = str(order_row["status"] or "")
+    if status in TERMINAL_STATUSES:
+        return order_row
+
+    order_id = int(order_row["id"])
+    assigned_runner_token = str(order_row["assigned_runner_token"] or "")
+    if status not in ACTIVE_RUNNER_ORDER_STATUSES or not assigned_runner_token:
+        return order_row
+
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    changed = False
+    last_runner_signal = (
+        parse_iso_timestamp(str(order_row["last_runner_heartbeat_at"] or ""))
+        or parse_iso_timestamp(str(order_row["assignment_started_at"] or ""))
+        or parse_iso_timestamp(str(order_row["status_updated_at"] or ""))
+        or parse_iso_timestamp(str(order_row["updated_at"] or ""))
+        or parse_iso_timestamp(str(order_row["created_at"] or ""))
+    )
+
+    if last_runner_signal is not None:
+        heartbeat_age = (now - last_runner_signal).total_seconds()
+        if heartbeat_age > RUNNER_HEARTBEAT_TIMEOUT_SECONDS:
+            if status == "assigned":
+                incident_created = open_order_incident(
+                    cur,
+                    order_row,
+                    code="runner_assignment_released",
+                    severity="high",
+                    summary="Runner assignment released after the device went silent.",
+                    detail="The runner stopped checking in while this order was assigned, so the assignment was cleared for reassignment.",
+                    observed_at=now_iso,
+                )
+                release_runner_assignment(cur, order_id, now_iso=now_iso)
+                changed = True
+            else:
+                incident_created = open_order_incident(
+                    cur,
+                    order_row,
+                    code="runner_unreachable",
+                    severity="high",
+                    summary="Runner connection lost during delivery.",
+                    detail=f"The assigned runner stopped checking in while the order was {status.replace('_', ' ')}.",
+                    observed_at=now_iso,
+                )
+                if incident_created:
+                    touch_order_record(cur, order_id, now_iso=now_iso)
+                    changed = True
+
+    if status in RUNNER_STALLED_SECONDS_BY_STATUS:
+        progress_anchor = (
+            parse_iso_timestamp(str(order_row["status_updated_at"] or ""))
+            or parse_iso_timestamp(str(order_row["updated_at"] or ""))
+            or parse_iso_timestamp(str(order_row["created_at"] or ""))
+        )
+        if progress_anchor is not None:
+            stalled_for = (now - progress_anchor).total_seconds()
+            if stalled_for > RUNNER_STALLED_SECONDS_BY_STATUS[status]:
+                incident_created = open_order_incident(
+                    cur,
+                    order_row,
+                    code="runner_progress_stalled",
+                    severity="warning",
+                    summary=f"Order has remained {status.replace('_', ' ')} longer than expected.",
+                    detail="The order has not progressed within the expected time window and should be reviewed.",
+                    observed_at=now_iso,
+                )
+                if incident_created:
+                    touch_order_record(cur, order_id, now_iso=now_iso)
+                    changed = True
+
+    if changed:
+        return read_order_row(cur, order_id)
+    return order_row
+
+
+def load_order_with_health(cur: sqlite3.Cursor, order_id: int) -> sqlite3.Row:
+    row = read_order_row(cur, order_id)
+    return reconcile_order_operational_health(cur, row)
+
+
+def serialize_order_row_with_health(cur: sqlite3.Cursor, row: sqlite3.Row) -> dict[str, object]:
+    incidents = read_open_order_incidents(cur, int(row["id"]))
+    payload = serialize_order_row(row)
+    payload["attention_required"] = len(incidents) > 0
+    payload["open_incidents"] = [serialize_incident_row(incident) for incident in incidents]
+    return payload
+
+
 def allocate_display_order_number(cur: sqlite3.Cursor, *, venue_slug: str, business_day: str) -> int:
     cur.execute(
         """
@@ -722,6 +1154,7 @@ def read_order_row(cur: sqlite3.Cursor, order_id: int) -> sqlite3.Row:
         """
         SELECT id, venue_slug, business_day, display_order_number,
                customer_id, assigned_runner_token, assigned_runner_role,
+               assignment_started_at, last_runner_heartbeat_at, status_updated_at,
                pickup_code, ready_for_collection_at, payment_status, payment_reference,
                failure_reason, failed_at, refund_reason, refunded_at, paid_at,
                tip_amount_pennies, tipped_at,
@@ -789,6 +1222,9 @@ def serialize_order_row(row: sqlite3.Row) -> dict[str, object]:
         "customer_id": row["customer_id"],
         "assigned_runner_token": row["assigned_runner_token"],
         "assigned_runner_role": row["assigned_runner_role"],
+        "assignment_started_at": row["assignment_started_at"],
+        "last_runner_heartbeat_at": row["last_runner_heartbeat_at"],
+        "status_updated_at": row["status_updated_at"],
         "pickup_code": row["pickup_code"],
         "ready_for_collection_at": row["ready_for_collection_at"],
         "payment_status": row["payment_status"],
@@ -881,14 +1317,20 @@ def transition_order_status(
 ) -> dict[str, str | int]:
     row = read_order_row(cur, order_id)
     current_status = str(row["status"])
-    if current_status == target_status:
+    same_status_runner_claim = (
+        actor_role == "runner"
+        and current_status == "assigned"
+        and target_status == "assigned"
+        and not str(row["assigned_runner_token"] or "")
+    )
+    if current_status == target_status and not same_status_runner_claim:
         return {"order_id": order_id, "status": current_status, "version": int(row["version"])}
 
     if current_status in TERMINAL_STATUSES:
         raise HTTPException(status_code=409, detail=f"Cannot transition terminal status '{current_status}'.")
 
     allowed = ALLOWED_TRANSITIONS.get(current_status, set())
-    if target_status not in allowed:
+    if target_status not in allowed and not same_status_runner_claim:
         raise HTTPException(
             status_code=409,
             detail=f"Invalid transition '{current_status}' -> '{target_status}'.",
@@ -896,6 +1338,8 @@ def transition_order_status(
 
     assigned_runner_token = row["assigned_runner_token"]
     assigned_runner_role = row["assigned_runner_role"]
+    assignment_started_at = row["assignment_started_at"]
+    last_runner_heartbeat_at = row["last_runner_heartbeat_at"]
     pickup_code = row["pickup_code"]
     ready_for_collection_at = row["ready_for_collection_at"]
     collect_order = is_click_and_collect_mode(str(row["delivery_mode"]))
@@ -919,32 +1363,53 @@ def transition_order_status(
                 raise HTTPException(status_code=409, detail="Runner already has an active assigned order.")
             assigned_runner_token = actor_token
             assigned_runner_role = actor_role
+            assignment_started_at = datetime.now(timezone.utc).isoformat()
+            last_runner_heartbeat_at = assignment_started_at
         elif target_status in ACTIVE_RUNNER_ORDER_STATUSES:
+            if not assigned_runner_token and current_status == "assigned":
+                assigned_runner_token = actor_token
+                assigned_runner_role = actor_role
+                assignment_started_at = row["assignment_started_at"] or datetime.now(timezone.utc).isoformat()
             if assigned_runner_token != actor_token:
                 raise HTTPException(status_code=403, detail="Order is assigned to a different runner.")
+            last_runner_heartbeat_at = datetime.now(timezone.utc).isoformat()
 
     now = datetime.now(timezone.utc).isoformat()
     if target_status == "ready_for_collection":
         pickup_code = pickup_code or make_pickup_code()
         ready_for_collection_at = now
+    if target_status not in ACTIVE_RUNNER_ORDER_STATUSES:
+        last_runner_heartbeat_at = None if target_status in TERMINAL_STATUSES else last_runner_heartbeat_at
     cur.execute(
         """
         UPDATE orders
-        SET status = ?, updated_at = ?, version = COALESCE(version, 1) + 1,
+        SET status = ?, updated_at = ?, status_updated_at = ?, version = COALESCE(version, 1) + 1,
             assigned_runner_token = ?, assigned_runner_role = ?,
+            assignment_started_at = ?, last_runner_heartbeat_at = ?,
             pickup_code = ?, ready_for_collection_at = ?
         WHERE id = ?
         """,
         (
             target_status,
             now,
+            now,
             assigned_runner_token,
             assigned_runner_role,
+            assignment_started_at,
+            last_runner_heartbeat_at,
             pickup_code,
             ready_for_collection_at,
             order_id,
         ),
     )
+    if target_status in ACTIVE_RUNNER_ORDER_STATUSES and actor_role == "runner":
+        resolve_order_incidents(
+            cur,
+            order_id,
+            actor_role="system",
+            codes=RUNNER_RECOVERY_INCIDENT_CODES,
+            auto_detected=True,
+        )
     cur.execute("SELECT version FROM orders WHERE id = ?", (order_id,))
     version_row = cur.fetchone()
     version = int(version_row["version"]) if version_row is not None else 1
@@ -1000,6 +1465,21 @@ def resolve_vendor_for_staff_login(cur: sqlite3.Cursor, venue_slug: str, vendor_
     if not bool(vendor_row["is_active"]):
         raise HTTPException(status_code=403, detail="Vendor is inactive.")
     return vendor_row
+
+
+def resolve_vendor_slug_for_dev_pin(venue_slug: str, pin: str, vendor_slug: str | None = None) -> str:
+    venue_vendor_pins = DEV_VENDOR_PINS.get(venue_slug.strip(), {})
+    normalized_pin = pin.strip()
+    if vendor_slug and vendor_slug.strip():
+        expected_pin = venue_vendor_pins.get(vendor_slug.strip())
+        if expected_pin != normalized_pin:
+            raise HTTPException(status_code=401, detail="Invalid vendor PIN.")
+        return vendor_slug.strip()
+
+    for configured_vendor_slug, configured_pin in venue_vendor_pins.items():
+        if configured_pin == normalized_pin:
+            return configured_vendor_slug
+    raise HTTPException(status_code=401, detail="Invalid vendor PIN.")
 
 
 def get_vendor_token_scope(
@@ -1178,6 +1658,7 @@ def require_staff_token(
         token_vendor_id = token_record.get("vendor_id")
         if token_vendor_id is None or int(token_vendor_id) != vendor_id:
             raise HTTPException(status_code=403, detail="Token does not match vendor.")
+    token_record["last_seen_at"] = datetime.now(timezone.utc).isoformat()
     return token_record
 
 
@@ -1191,26 +1672,98 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/api/bug-reports")
+def create_bug_report(payload: BugReportRequest) -> dict[str, object]:
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="Bug report message is required.")
+    created_at = datetime.now(timezone.utc).isoformat()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO bug_reports (
+          title, message, description, source, role, venue_slug, route_name,
+          page_url, user_agent, stack, context_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload.title.strip() if payload.title else None,
+            message,
+            payload.description.strip() if payload.description else None,
+            payload.source.strip() if payload.source else None,
+            payload.role.strip() if payload.role else None,
+            payload.venue_slug.strip() if payload.venue_slug else None,
+            payload.route_name.strip() if payload.route_name else None,
+            payload.page_url.strip() if payload.page_url else None,
+            payload.user_agent.strip() if payload.user_agent else None,
+            payload.stack.strip() if payload.stack else None,
+            json.dumps(payload.context_json) if payload.context_json is not None else None,
+            created_at,
+        ),
+    )
+    conn.commit()
+    report_id = int(cur.lastrowid)
+    conn.close()
+    return {"report_id": report_id, "created_at": created_at}
+
+
 @app.post("/api/staff/auth")
 def staff_auth(payload: StaffAuthRequest) -> dict[str, object]:
-    expected_pin = DEV_STAFF_PINS.get(payload.venue_slug.strip())
-    if expected_pin is None or payload.pin.strip() != expected_pin:
-        raise HTTPException(status_code=401, detail="Invalid staff PIN.")
+    normalized_venue_slug = payload.venue_slug.strip()
+    normalized_pin = payload.pin.strip()
+    resolved_vendor_slug: str | None = None
+    if payload.role == "vendor":
+        resolved_vendor_slug = resolve_vendor_slug_for_dev_pin(
+            normalized_venue_slug,
+            normalized_pin,
+            payload.vendor_slug,
+        )
+    else:
+        expected_pin = DEV_STAFF_PINS.get(normalized_venue_slug)
+        if expected_pin is None or normalized_pin != expected_pin:
+            raise HTTPException(status_code=401, detail="Invalid staff PIN.")
 
     token_record: dict[str, object] = {
-        "venue_slug": payload.venue_slug.strip(),
+        "venue_slug": normalized_venue_slug,
         "role": payload.role,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
     }
     if payload.role == "vendor":
         conn = get_conn()
         cur = conn.cursor()
-        vendor_row = resolve_vendor_for_staff_login(cur, payload.venue_slug.strip(), payload.vendor_slug)
+        vendor_row = resolve_vendor_for_staff_login(cur, normalized_venue_slug, resolved_vendor_slug)
         conn.close()
         token_record["vendor_id"] = int(vendor_row["id"])
         token_record["vendor_slug"] = str(vendor_row["slug"])
         token_record["vendor_name"] = str(vendor_row["name"])
 
+    token = secrets.token_urlsafe(24)
+    STAFF_TOKENS[token] = token_record
+    return {"token": token, **token_record}
+
+
+@app.post("/api/runner/access")
+def runner_access(payload: RunnerAccessRequest) -> dict[str, object]:
+    access_code = payload.access_code.strip()
+    if not access_code:
+        raise HTTPException(status_code=422, detail="Access code is required.")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    venue_row = read_venue_by_runner_access_code(cur, access_code)
+    conn.close()
+    if venue_row is None:
+        raise HTTPException(status_code=401, detail="Invalid runner access code.")
+
+    token_record: dict[str, object] = {
+        "venue_slug": str(venue_row["slug"]),
+        "venue_name": str(venue_row["name"]),
+        "role": "runner",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+    }
     token = secrets.token_urlsafe(24)
     STAFF_TOKENS[token] = token_record
     return {"token": token, **token_record}
@@ -1635,8 +2188,8 @@ async def create_order(request: Request) -> dict[str, object]:
           venue_slug, business_day, display_order_number, customer_id, payment_status, payment_reference, paid_at,
           tip_amount_pennies, tipped_at,
           customer_name, customer_email, delivery_mode, delivery_target,
-          items_json, checkout_type, status, eta_text, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          items_json, checkout_type, status, eta_text, created_at, updated_at, status_updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload.venue_slug.strip(),
@@ -1656,6 +2209,7 @@ async def create_order(request: Request) -> dict[str, object]:
             payload.checkout_type,
             "received",
             eta_text,
+            now,
             now,
             now,
         ),
@@ -1701,8 +2255,13 @@ def get_customer_active_order(
         venue_slug=venue_slug.strip(),
         customer_id=int(customer_row["id"]),
     )
+    payload = None
+    if active_order_row is not None:
+        reconciled_row = load_order_with_health(cur, int(active_order_row["id"]))
+        payload = serialize_order_row_with_health(cur, reconciled_row)
+    conn.commit()
     conn.close()
-    return {"active_order": serialize_order_row(active_order_row) if active_order_row is not None else None}
+    return {"active_order": payload}
 
 
 @app.get("/api/runners/active-order")
@@ -1722,8 +2281,14 @@ def get_runner_active_order(
         venue_slug=venue_slug.strip(),
         runner_token=runner_token,
     )
+    payload = None
+    if active_order_row is not None:
+        active_order_row = record_runner_heartbeat(cur, active_order_row, runner_token=runner_token)
+        reconciled_row = reconcile_order_operational_health(cur, active_order_row)
+        payload = serialize_order_row_with_health(cur, reconciled_row)
+    conn.commit()
     conn.close()
-    return {"active_order": serialize_order_row(active_order_row) if active_order_row is not None else None}
+    return {"active_order": payload}
 
 
 @app.get("/api/orders")
@@ -1740,13 +2305,7 @@ def list_orders(
     if venue_slug and status:
         cur.execute(
             """
-            SELECT id, venue_slug, business_day, display_order_number,
-                   customer_id, assigned_runner_token, assigned_runner_role,
-                   pickup_code, ready_for_collection_at, payment_status, payment_reference,
-                   failure_reason, failed_at, refund_reason, refunded_at, paid_at,
-                   tip_amount_pennies, tipped_at,
-                   customer_name, delivery_mode, delivery_target, items_json,
-                   version, checkout_type, status, eta_text, created_at, updated_at
+            SELECT id
             FROM orders
             WHERE venue_slug = ? AND status = ?
             ORDER BY created_at DESC, id DESC
@@ -1757,13 +2316,7 @@ def list_orders(
     elif venue_slug:
         cur.execute(
             """
-            SELECT id, venue_slug, business_day, display_order_number,
-                   customer_id, assigned_runner_token, assigned_runner_role,
-                   pickup_code, ready_for_collection_at, payment_status, payment_reference,
-                   failure_reason, failed_at, refund_reason, refunded_at, paid_at,
-                   tip_amount_pennies, tipped_at,
-                   customer_name, delivery_mode, delivery_target, items_json,
-                   version, checkout_type, status, eta_text, created_at, updated_at
+            SELECT id
             FROM orders
             WHERE venue_slug = ?
             ORDER BY created_at DESC, id DESC
@@ -1774,13 +2327,7 @@ def list_orders(
     elif status:
         cur.execute(
             """
-            SELECT id, venue_slug, business_day, display_order_number,
-                   customer_id, assigned_runner_token, assigned_runner_role,
-                   pickup_code, ready_for_collection_at, payment_status, payment_reference,
-                   failure_reason, failed_at, refund_reason, refunded_at, paid_at,
-                   tip_amount_pennies, tipped_at,
-                   customer_name, delivery_mode, delivery_target, items_json,
-                   version, checkout_type, status, eta_text, created_at, updated_at
+            SELECT id
             FROM orders
             WHERE status = ?
             ORDER BY created_at DESC, id DESC
@@ -1791,59 +2338,22 @@ def list_orders(
     else:
         cur.execute(
             """
-            SELECT id, venue_slug, business_day, display_order_number,
-                   customer_id, assigned_runner_token, assigned_runner_role,
-                   pickup_code, ready_for_collection_at, payment_status, payment_reference,
-                   failure_reason, failed_at, refund_reason, refunded_at, paid_at,
-                   tip_amount_pennies, tipped_at,
-                   customer_name, delivery_mode, delivery_target, items_json,
-                   version, checkout_type, status, eta_text, created_at, updated_at
+            SELECT id
             FROM orders
             ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
             (safe_limit,),
         )
-    rows = cur.fetchall()
+    rows = [load_order_with_health(cur, int(row["id"])) for row in cur.fetchall()]
     if str(token_record.get("role") or "") == "vendor":
         vendor_scope_id = get_vendor_token_scope(token_record)
         rows = [row for row in rows if order_is_owned_by_vendor(cur, row, vendor_scope_id)]
+    payload = [serialize_order_row_with_health(cur, row) for row in rows]
+    conn.commit()
     conn.close()
     return {
-        "orders": [
-            {
-                "order_id": row["id"],
-                "business_day": row["business_day"],
-                "display_order_number": int(row["display_order_number"] or row["id"]),
-                "venue_slug": row["venue_slug"],
-                "customer_id": row["customer_id"],
-                "assigned_runner_token": row["assigned_runner_token"],
-                "assigned_runner_role": row["assigned_runner_role"],
-                "pickup_code": row["pickup_code"],
-                "ready_for_collection_at": row["ready_for_collection_at"],
-                "payment_status": row["payment_status"],
-                "payment_reference": row["payment_reference"],
-                "failure_reason": row["failure_reason"],
-                "failed_at": row["failed_at"],
-                "refund_reason": row["refund_reason"],
-                "refunded_at": row["refunded_at"],
-                "paid_at": row["paid_at"],
-                "tip_amount_pennies": int(row["tip_amount_pennies"] or 0),
-                "tipped_at": row["tipped_at"],
-                "has_tip": int(row["tip_amount_pennies"] or 0) > 0,
-                "customer_name": row["customer_name"],
-                "delivery_mode": row["delivery_mode"],
-                "delivery_target": row["delivery_target"],
-                "items": json.loads(row["items_json"]),
-                "version": row["version"],
-                "checkout_type": row["checkout_type"],
-                "status": row["status"],
-                "eta_text": row["eta_text"],
-                "created_at": row["created_at"],
-                "updated_at": row["updated_at"],
-            }
-            for row in rows
-        ]
+        "orders": payload
     }
 
 
@@ -1851,40 +2361,11 @@ def list_orders(
 def order_status(order_id: int) -> dict:
     conn = get_conn()
     cur = conn.cursor()
-    row = read_order_row(cur, order_id)
+    row = load_order_with_health(cur, order_id)
+    payload = serialize_order_row_with_health(cur, row)
+    conn.commit()
     conn.close()
-    return {
-        "order_id": row["id"],
-        "business_day": row["business_day"],
-        "display_order_number": int(row["display_order_number"] or row["id"]),
-        "venue_slug": row["venue_slug"],
-        "customer_id": row["customer_id"],
-        "assigned_runner_token": row["assigned_runner_token"],
-        "assigned_runner_role": row["assigned_runner_role"],
-        "pickup_code": row["pickup_code"],
-        "ready_for_collection_at": row["ready_for_collection_at"],
-        "payment_status": row["payment_status"],
-        "payment_reference": row["payment_reference"],
-        "failure_reason": row["failure_reason"],
-        "failed_at": row["failed_at"],
-        "refund_reason": row["refund_reason"],
-        "refunded_at": row["refunded_at"],
-        "paid_at": row["paid_at"],
-        "tip_amount_pennies": int(row["tip_amount_pennies"] or 0),
-        "tipped_at": row["tipped_at"],
-        "has_tip": int(row["tip_amount_pennies"] or 0) > 0,
-        "customer_name": row["customer_name"],
-        "customer_email": row["customer_email"],
-        "delivery_mode": row["delivery_mode"],
-        "delivery_target": row["delivery_target"],
-        "items": json.loads(row["items_json"]),
-        "version": row["version"],
-        "checkout_type": row["checkout_type"],
-        "status": row["status"],
-        "eta_text": row["eta_text"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-    }
+    return payload
 
 
 @app.post("/api/orders/{order_id}/accept")
@@ -2017,6 +2498,100 @@ def fail_order(
     conn.close()
     response = serialize_order_row(updated)
     response["status_result"] = result
+    return response
+
+
+@app.post("/api/orders/{order_id}/attention")
+def flag_order_attention(
+    order_id: int,
+    payload: OrderAttentionRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    reason = payload.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="Reason is required.")
+    conn = get_conn()
+    cur = conn.cursor()
+    row = read_order_row(cur, order_id)
+    token_record = require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"vendor", "admin"})
+    if str(token_record.get("role") or "") == "vendor" and not order_is_owned_by_vendor(cur, row, get_vendor_token_scope(token_record)):
+        conn.close()
+        raise HTTPException(status_code=403, detail="Order does not belong to this vendor.")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    created = open_order_incident(
+        cur,
+        row,
+        code="manual_attention",
+        severity="warning",
+        summary="Manual attention requested for this order.",
+        detail=reason,
+        auto_detected=False,
+        opened_by_role=str(token_record["role"]),
+        observed_at=now_iso,
+    )
+    if created:
+        touch_order_record(cur, order_id, now_iso=now_iso)
+    updated = load_order_with_health(cur, order_id)
+    response = serialize_order_row_with_health(cur, updated)
+    conn.commit()
+    conn.close()
+    return response
+
+
+@app.post("/api/orders/{order_id}/resolve-attention")
+def resolve_order_attention(
+    order_id: int,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    conn = get_conn()
+    cur = conn.cursor()
+    row = read_order_row(cur, order_id)
+    token_record = require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"vendor", "admin"})
+    if str(token_record.get("role") or "") == "vendor" and not order_is_owned_by_vendor(cur, row, get_vendor_token_scope(token_record)):
+        conn.close()
+        raise HTTPException(status_code=403, detail="Order does not belong to this vendor.")
+    resolved = resolve_order_incidents(cur, order_id, actor_role=str(token_record["role"]))
+    if resolved:
+        touch_order_record(cur, order_id, now_iso=datetime.now(timezone.utc).isoformat())
+    updated = load_order_with_health(cur, order_id)
+    response = serialize_order_row_with_health(cur, updated)
+    conn.commit()
+    conn.close()
+    return response
+
+
+@app.post("/api/orders/{order_id}/release-runner")
+def release_order_runner(
+    order_id: int,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    conn = get_conn()
+    cur = conn.cursor()
+    row = read_order_row(cur, order_id)
+    token_record = require_staff_token(authorization, venue_slug=str(row["venue_slug"]), allowed_roles={"vendor", "admin"})
+    if str(token_record.get("role") or "") == "vendor" and not order_is_owned_by_vendor(cur, row, get_vendor_token_scope(token_record)):
+        conn.close()
+        raise HTTPException(status_code=403, detail="Order does not belong to this vendor.")
+    if str(row["status"] or "") != "assigned" or not str(row["assigned_runner_token"] or ""):
+        conn.close()
+        raise HTTPException(status_code=409, detail="Only assigned orders with a runner can be released.")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    open_order_incident(
+        cur,
+        row,
+        code="manual_runner_release",
+        severity="high",
+        summary="Runner was manually released from this order.",
+        detail="Venue staff released the runner assignment so another runner can recover the order.",
+        auto_detected=False,
+        opened_by_role=str(token_record["role"]),
+        observed_at=now_iso,
+    )
+    release_runner_assignment(cur, order_id, now_iso=now_iso)
+    updated = load_order_with_health(cur, order_id)
+    response = serialize_order_row_with_health(cur, updated)
+    conn.commit()
+    conn.close()
     return response
 
 

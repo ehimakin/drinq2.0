@@ -8,6 +8,7 @@ const ACTIVE_ORDER_KEY_PREFIX = "drinq_active_order_";
 const DELIVERY_MODE_PREF_KEY_PREFIX = "drinq_delivery_mode_";
 const PENDING_TIP_KEY_PREFIX = "drinq_pending_tip_";
 const MENU_CATEGORY_FILTER_KEY_PREFIX = "drinq_menu_category_filter_";
+const VENDOR_DISPLAY_NAME_KEY_PREFIX = "drinq_vendor_display_name_";
 const PAGE_POLL_INTERVAL_MS = 5000;
 const TIP_OPTIONS_PENNIES = [100, 200, 300, 500];
 // DEV ONLY: local staff PIN flow is enabled for prototype testing.
@@ -25,10 +26,47 @@ const VENDOR_ROLE_BINDINGS = {
 };
 let pagePollHandle = null;
 let pagePollInFlight = false;
+const BUG_ALERT_MODAL_ID = "bugAlertModal";
+const BUG_ALERT_DEDUPE_WINDOW_MS = 4000;
+let lastBugAlertFingerprint = "";
+let lastBugAlertAt = 0;
+
+function isRunnerPortalPath() {
+  const pathname = window.location.pathname || "/";
+  return /^\/runner\/?$/.test(pathname);
+}
+
+function isVendorPortalPath() {
+  const pathname = window.location.pathname || "/";
+  return /^\/vendor\/?$/.test(pathname);
+}
+
+function buildAppEntryUrl(pathname, params = {}) {
+  const url = new URL(window.location.href);
+  url.pathname = pathname;
+  url.hash = "";
+  Object.entries(params).forEach(([key, value]) => {
+    if (value === null || value === undefined || value === "") {
+      url.searchParams.delete(key);
+      return;
+    }
+    url.searchParams.set(key, String(value));
+  });
+  return url.toString();
+}
 
 function getVenueSlug() {
-  const querySlug = new URLSearchParams(window.location.search).get("venue");
+  const searchParams = new URLSearchParams(window.location.search);
+  const querySlug = searchParams.get("venue");
   if (querySlug) return querySlug;
+
+  const staffSession = getStaffSession();
+  if (isVendorPortalPath() && staffSession?.role === "vendor" && staffSession?.venue_slug) {
+    return String(staffSession.venue_slug);
+  }
+  if ((isRunnerPortalPath() || searchParams.get("role") === "runner") && staffSession?.role === "runner" && staffSession?.venue_slug) {
+    return String(staffSession.venue_slug);
+  }
 
   const hash = window.location.hash || "";
   const hashVenueMatch = hash.match(/#\/v\/([^/?]+)/i);
@@ -46,6 +84,8 @@ function getApiBase() {
 }
 
 function getRole() {
+  if (isRunnerPortalPath()) return "runner";
+  if (isVendorPortalPath()) return "vendor";
   const queryRole = new URLSearchParams(window.location.search).get("role");
   if (queryRole && queryRole in ROLE_PERMISSIONS) return queryRole;
   return "customer";
@@ -69,7 +109,7 @@ function getRoute() {
 
 function getStaffSession() {
   try {
-    const raw = localStorage.getItem(STAFF_SESSION_KEY);
+    const raw = sessionStorage.getItem(STAFF_SESSION_KEY) || localStorage.getItem(STAFF_SESSION_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
@@ -81,17 +121,22 @@ function getStaffSession() {
 }
 
 function setStaffSession(session) {
-  localStorage.setItem(STAFF_SESSION_KEY, JSON.stringify(session));
+  sessionStorage.setItem(STAFF_SESSION_KEY, JSON.stringify(session));
+  localStorage.removeItem(STAFF_SESSION_KEY);
+  if (session?.role === "vendor" && session?.venue_slug && session?.vendor_name) {
+    localStorage.setItem(`${VENDOR_DISPLAY_NAME_KEY_PREFIX}${session.venue_slug}`, String(session.vendor_name));
+  }
 }
 
 function clearStaffSession() {
+  sessionStorage.removeItem(STAFF_SESSION_KEY);
   localStorage.removeItem(STAFF_SESSION_KEY);
 }
 
 function handleStaffLogout() {
   clearStaffSession();
   if (getRoute().name === "menu") {
-    render();
+    requestRender("logout");
     return;
   }
   setRoute("/");
@@ -109,7 +154,11 @@ function isStaffSessionError(error) {
 
 function getVendorSlugForRole(venueSlug, role) {
   if (role !== "vendor") return "";
-  return VENDOR_ROLE_BINDINGS[venueSlug] || "";
+  const session = getStaffSession();
+  if (session?.venue_slug === venueSlug && session?.vendor_slug) {
+    return String(session.vendor_slug);
+  }
+  return "";
 }
 
 function getVendorDisplayName(venueSlug) {
@@ -117,14 +166,15 @@ function getVendorDisplayName(venueSlug) {
   if (session?.venue_slug === venueSlug && session?.vendor_name) {
     return String(session.vendor_name);
   }
-  const vendorSlug = VENDOR_ROLE_BINDINGS[venueSlug] || "";
-  if (vendorSlug === "50pints") return "50Pints";
-  if (!vendorSlug) return "Vendor";
-  return vendorSlug
-    .split("-")
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
+  const persistedVendorName = localStorage.getItem(`${VENDOR_DISPLAY_NAME_KEY_PREFIX}${venueSlug}`);
+  if (persistedVendorName) {
+    return persistedVendorName;
+  }
+  const configuredVendorSlug = VENDOR_ROLE_BINDINGS[venueSlug];
+  if (configuredVendorSlug) {
+    return configuredVendorSlug.replaceAll("-", " ");
+  }
+  return "Vendor";
 }
 
 function getAuthHeader(venueSlug, requestedRole) {
@@ -153,7 +203,8 @@ function renderStaffSessionButton(venueSlug, role, permissions, variant = "ghost
 }
 
 async function loginStaff(apiBase, venueSlug, role) {
-  const pin = window.prompt(`Enter staff PIN for ${venueSlug} (${role})`);
+  const promptTarget = role === "vendor" ? getVendorDisplayName(venueSlug) : `${venueSlug} (${role})`;
+  const pin = window.prompt(`Enter staff PIN for ${promptTarget}`);
   if (!pin) return false;
   const vendorSlug = getVendorSlugForRole(venueSlug, role);
   const response = await fetch(`${apiBase}/api/staff/auth`, {
@@ -172,6 +223,40 @@ async function loginStaff(apiBase, venueSlug, role) {
   const data = await response.json();
   setStaffSession(data);
   return true;
+}
+
+async function loginRunnerWithAccessCode(apiBase, accessCode) {
+  const response = await fetch(`${apiBase}/api/runner/access`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ access_code: String(accessCode || "").trim() })
+  });
+  if (!response.ok) {
+    throw new Error(`Runner access failed (${response.status})`);
+  }
+  const data = await response.json();
+  setStaffSession(data);
+  return data;
+}
+
+async function loginVendorWithPin(apiBase, venueSlug, pin) {
+  const vendorSlug = getVendorSlugForRole(venueSlug, "vendor");
+  const response = await fetch(`${apiBase}/api/staff/auth`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      venue_slug: venueSlug,
+      pin: String(pin || "").trim(),
+      role: "vendor",
+      vendor_slug: vendorSlug || null
+    })
+  });
+  if (!response.ok) {
+    throw new Error(`Vendor auth failed (${response.status})`);
+  }
+  const data = await response.json();
+  setStaffSession(data);
+  return data;
 }
 
 function cartKey(venueSlug) {
@@ -683,6 +768,7 @@ function updateOrderStatusDom({ venueSlug, orderData, role, apiBase }) {
   const isTerminal = ["fulfilled", "collected", "uncollected", "rejected", "cancelled", "failed"].includes(status);
   const payment = describePaymentStatus(orderData.payment_status);
   const customerState = describeCustomerOrderState(orderData);
+  const leadIncident = Array.isArray(orderData.open_incidents) ? orderData.open_incidents[0] : null;
   const canTip = shouldOfferTipForOrder(orderData, role);
   const showCompletionTipButton = canTip && (isFulfilled || isCollected);
   const showActionTipButton = canTip && !showCompletionTipButton;
@@ -722,6 +808,11 @@ function updateOrderStatusDom({ venueSlug, orderData, role, apiBase }) {
         }
         <span aria-hidden="true">•</span><span>Final total ${escapeHtml(finalTotal)}</span>
       </p>
+      ${
+        leadIncident
+          ? `<p class="api-note"><strong>Attention:</strong> ${escapeHtml(leadIncident.summary || "The venue is reviewing a fulfilment issue.")}</p>`
+          : ""
+      }
     </section>
   `;
 
@@ -811,6 +902,7 @@ function renderRunnerOrdersDom(container, { activeOrder, orders }) {
         <p><strong>Customer:</strong> ${escapeHtml(activeOrder.customer_name)}</p>
         <p><strong>Mode:</strong> ${escapeHtml(activeOrder.delivery_mode)} · <strong>ETA:</strong> ${escapeHtml(activeOrder.eta_text)}</p>
         <p><strong>Target:</strong> ${escapeHtml(activeOrder.delivery_target)}</p>
+        ${renderOrderAttention(activeOrder)}
         <p class="api-note">Runner is locked to this order until it reaches a terminal state.</p>
         ${runnerActionButtons(activeOrder)}
       </article>
@@ -832,6 +924,7 @@ function renderRunnerOrdersDom(container, { activeOrder, orders }) {
         <p><strong>Customer:</strong> ${escapeHtml(order.customer_name)}</p>
         <p><strong>Mode:</strong> ${escapeHtml(order.delivery_mode)} · <strong>ETA:</strong> ${escapeHtml(order.eta_text)}</p>
         <p><strong>Target:</strong> ${escapeHtml(order.delivery_target)}</p>
+        ${renderOrderAttention(order)}
         ${runnerActionButtons(order)}
       </article>
     `
@@ -881,6 +974,31 @@ function renderOrderItemsSummary(items) {
   `;
 }
 
+function renderOrderAttention(order) {
+  const incidents = Array.isArray(order.open_incidents) ? order.open_incidents : [];
+  if (!incidents.length) {
+    return "";
+  }
+  return `
+    <section class="form-card">
+      <p><strong>Attention Required</strong></p>
+      <ul class="summary-list">
+        ${incidents
+          .map(
+            (incident) => `
+              <li>
+                <span>${escapeHtml(String(incident.summary || "Operational issue"))}</span>
+                <span>${escapeHtml(String(incident.severity || "warning").toUpperCase())}</span>
+              </li>
+            `
+          )
+          .join("")}
+      </ul>
+      ${incidents[0]?.detail ? `<p class="api-note">${escapeHtml(incidents[0].detail)}</p>` : ""}
+    </section>
+  `;
+}
+
 function renderVenueOrdersDom(container, orders, venueSlug, isAdmin = false) {
   if (!orders || orders.length === 0) {
     container.innerHTML = `<section class="form-card"><p>No orders yet for ${escapeHtml(venueSlug)}.</p></section>`;
@@ -900,6 +1018,7 @@ function renderVenueOrdersDom(container, orders, venueSlug, isAdmin = false) {
         <p><strong>Payment:</strong> ${escapeHtml(order.payment_status || "pending")}</p>
         ${order.failure_reason ? `<p><strong>Failure:</strong> ${escapeHtml(order.failure_reason)}</p>` : ""}
         ${order.refund_reason ? `<p><strong>Refund:</strong> ${escapeHtml(order.refund_reason)}</p>` : ""}
+        ${renderOrderAttention(order)}
         ${
           isClickAndCollectOrder(order)
             ? `
@@ -936,9 +1055,18 @@ function bindVenueActionButtons(container, { venueSlug, apiBase, authHeader }) {
           headers["Content-Type"] = "application/json";
           options.body = JSON.stringify({ pickup_code: enteredCode.trim() });
         }
-        if (action === "fail" || action === "refund") {
-          const reasonPrompt = action === "fail" ? "Reason for order failure?" : "Reason for refund?";
+        if (action === "fail" || action === "refund" || action === "attention") {
+          const reasonPrompt =
+            action === "fail"
+              ? "Reason for order failure?"
+              : action === "refund"
+                ? "Reason for refund?"
+                : "What issue should be flagged on this order?";
           const enteredReason = window.prompt(reasonPrompt, "");
+          if (action === "attention" && !enteredReason?.trim()) {
+            btn.disabled = false;
+            return;
+          }
           headers["Content-Type"] = "application/json";
           options.body = JSON.stringify({ reason: enteredReason?.trim() || null });
         }
@@ -1102,6 +1230,8 @@ function normalizeMenuItem(item) {
     item_id: item.item_id || item.id,
     name: item.name || item.item_name,
     item_name: item.item_name || item.name,
+    vendor_name: item.vendor_name || "",
+    vendor_slug: item.vendor_slug || "",
     category: item.category,
     price: item.price || item.price_text,
     price_text: item.price_text || item.price,
@@ -1194,6 +1324,174 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function normalizeBugError(error) {
+  if (error instanceof Error) {
+    return {
+      message: error.message || "Unexpected error",
+      stack: error.stack || "",
+      status: Number(error.status || 0) || null
+    };
+  }
+  if (typeof error === "string") {
+    return { message: error, stack: "", status: null };
+  }
+  if (error && typeof error === "object") {
+    const message = typeof error.message === "string" && error.message.trim() ? error.message.trim() : "Unexpected error";
+    return {
+      message,
+      stack: typeof error.stack === "string" ? error.stack : "",
+      status: Number(error.status || 0) || null
+    };
+  }
+  return { message: "Unexpected error", stack: "", status: null };
+}
+
+function shouldOfferDiagnosticReport(error) {
+  const normalized = normalizeBugError(error);
+  return !normalized.status || normalized.status >= 500;
+}
+
+function closeBugAlert() {
+  document.getElementById(BUG_ALERT_MODAL_ID)?.remove();
+}
+
+async function submitBugReport({
+  title,
+  message,
+  description = "",
+  source = "ui",
+  error = null
+}) {
+  const normalized = normalizeBugError(error);
+  const payload = {
+    title,
+    message,
+    description: String(description || "").trim() || null,
+    source,
+    role: getRole(),
+    venue_slug: getVenueSlug(),
+    route_name: getRoute().name,
+    page_url: window.location.href,
+    user_agent: window.navigator?.userAgent || "",
+    stack: normalized.stack || null,
+    context_json: {
+      status: normalized.status,
+      pathname: window.location.pathname || "",
+      hash: window.location.hash || "",
+      search: window.location.search || ""
+    }
+  };
+  const response = await fetch(`${getApiBase()}/api/bug-reports`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    keepalive: true
+  });
+  if (!response.ok) {
+    throw new Error(`Bug report failed (${response.status})`);
+  }
+  return response.json();
+}
+
+function showAppAlert({
+  title = "That action didn't complete.",
+  message = "Please try again.",
+  error = null,
+  source = "ui",
+  reportable = true
+}) {
+  const normalized = normalizeBugError(error);
+  const resolvedMessage = String(message || normalized.message || "Please try again.").trim();
+  const fingerprint = `${title}|${resolvedMessage}|${source}`;
+  const now = Date.now();
+  if (fingerprint === lastBugAlertFingerprint && now - lastBugAlertAt < BUG_ALERT_DEDUPE_WINDOW_MS) {
+    return;
+  }
+  lastBugAlertFingerprint = fingerprint;
+  lastBugAlertAt = now;
+  closeBugAlert();
+  document.body.insertAdjacentHTML(
+    "beforeend",
+    `
+      <div class="bug-alert-backdrop" id="${BUG_ALERT_MODAL_ID}">
+        <div class="bug-alert-modal" role="dialog" aria-modal="true" aria-labelledby="bugAlertTitle">
+          <p class="bug-alert-kicker">System Alert</p>
+          <h2 id="bugAlertTitle">${escapeHtml(title)}</h2>
+          <p class="bug-alert-copy">${escapeHtml(resolvedMessage)}</p>
+          ${
+            reportable
+              ? `
+                <label for="bugAlertDescription">What were you trying to do? Optional.</label>
+                <textarea id="bugAlertDescription" rows="4" placeholder="Add a short description to help reproduce the issue."></textarea>
+                <p class="api-note" id="bugAlertStatus">You can send a bug report with the current page context.</p>
+              `
+              : `<p class="api-note">You can close this message and try again.</p>`
+          }
+          ${
+            normalized.stack
+              ? `
+                <details class="bug-alert-details">
+                  <summary>Technical details</summary>
+                  <pre>${escapeHtml(normalized.stack)}</pre>
+                </details>
+              `
+              : ""
+          }
+          <div class="bug-alert-actions">
+            ${reportable ? `<button class="inline-btn ghost" type="button" id="bugAlertReportBtn">Send Report</button>` : ""}
+            <button class="inline-btn" type="button" id="bugAlertDismissBtn">Try Again</button>
+          </div>
+        </div>
+      </div>
+    `
+  );
+  document.getElementById("bugAlertDismissBtn")?.addEventListener("click", closeBugAlert);
+  document.getElementById(BUG_ALERT_MODAL_ID)?.addEventListener("click", (event) => {
+    if (event.target?.id === BUG_ALERT_MODAL_ID) {
+      closeBugAlert();
+    }
+  });
+  document.getElementById("bugAlertReportBtn")?.addEventListener("click", async () => {
+    const reportBtn = document.getElementById("bugAlertReportBtn");
+    const status = document.getElementById("bugAlertStatus");
+    const description = document.getElementById("bugAlertDescription")?.value || "";
+    if (!reportBtn || !status) return;
+    reportBtn.disabled = true;
+    status.textContent = "Sending report...";
+    try {
+      const result = await submitBugReport({
+        title,
+        message: resolvedMessage,
+        description,
+        source,
+        error
+      });
+      status.textContent = `Report sent. Reference #${result.report_id}.`;
+    } catch (reportError) {
+      status.textContent = `Could not send report: ${normalizeBugError(reportError).message}`;
+      reportBtn.disabled = false;
+    }
+  });
+}
+
+function handleUnexpectedError(error, source = "unexpected") {
+  const normalized = normalizeBugError(error);
+  console.error(error);
+  showAppAlert({
+    title: "Oops, that wasn't meant to happen.",
+    message: normalized.message || "Something unexpected happened.",
+    error,
+    source,
+    reportable: true
+  });
+}
+
+function requestRender(source = "render") {
+  Promise.resolve(render()).catch((error) => {
+    handleUnexpectedError(error, source);
+  });
+}
+
 function setRoute(path) {
   window.location.hash = path;
 }
@@ -1223,7 +1521,7 @@ function renderForbidden(role, routeName, venueSlug, apiBase) {
     try {
       const ok = await loginStaff(apiBase, venueSlug, role);
       if (ok) {
-        render();
+        requestRender("forbidden-login");
       }
     } catch (error) {
       alert(`Staff login failed: ${error.message}`);
@@ -1233,6 +1531,115 @@ function renderForbidden(role, routeName, venueSlug, apiBase) {
     handleStaffLogout();
   });
   document.getElementById("forbiddenBackBtn")?.addEventListener("click", () => setRoute("/"));
+}
+
+function renderRunnerAccessPage(apiBase, errorMessage = "") {
+  const session = getStaffSession();
+  const connectedVenueName = session?.role === "runner" ? session.venue_name || session.venue_slug || "Connected venue" : "";
+  app.innerHTML = `
+    <section class="hero venue-hero venue-hero-compact">
+      <div class="hero-copy">
+        <span class="brand-chip">RUNNER ACCESS</span>
+        <h1 class="venue-title">Runner Stream Access</h1>
+        <p class="venue-copy">Enter your venue access code to connect this device to the pooled runner stream.</p>
+      </div>
+    </section>
+    <section class="form-card">
+      <h2>Venue Access Code</h2>
+      <p class="api-note">Use the venue-issued runner code for the site you are working at. Dev code for Brentford: <strong>8888</strong>.</p>
+      ${errorMessage ? `<p class="unknown">${escapeHtml(errorMessage)}</p>` : ""}
+      <form id="runnerAccessForm">
+        <label for="runnerAccessCodeInput">Access Code</label>
+        <input id="runnerAccessCodeInput" name="accessCode" inputmode="numeric" autocomplete="one-time-code" placeholder="Enter code" required />
+        <div class="runner-actions">
+          <button class="inline-btn" type="submit">Connect To Stream</button>
+          ${
+            session?.role === "runner"
+              ? `<button class="inline-btn ghost" type="button" id="resumeRunnerSessionBtn">Resume ${escapeHtml(String(connectedVenueName))}</button>`
+              : ""
+          }
+        </div>
+      </form>
+    </section>
+  `;
+
+  document.getElementById("runnerAccessForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const accessCode = String(form.get("accessCode") || "").trim();
+    if (!accessCode) return;
+    try {
+      await loginRunnerWithAccessCode(apiBase, accessCode);
+      setRoute("/runner-stream");
+    } catch (error) {
+      renderRunnerAccessPage(apiBase, `Could not connect runner device: ${error.message}`);
+    }
+  });
+
+  document.getElementById("resumeRunnerSessionBtn")?.addEventListener("click", () => {
+    setRoute("/runner-stream");
+  });
+}
+
+function renderVendorAccessPage(apiBase, errorMessage = "") {
+  const session = getStaffSession();
+  const venueSlug = session?.role === "vendor" ? String(session.venue_slug || "") : getVenueSlug();
+  app.innerHTML = `
+    <section class="hero venue-hero access-hero">
+      <div class="hero-copy">
+        <span class="brand-chip">VENDOR ACCESS</span>
+        <h1 class="venue-title">Vendor Login</h1>
+        <p class="venue-copy">Sign in to load your vendor menu and manage items for the current vendor account.</p>
+      </div>
+      <div class="venue-hero-badge">DRQ</div>
+    </section>
+    <section class="form-card">
+      <h2>Vendor Access</h2>
+      <p class="api-note">Current prototype scope is single-venue bound. Venue-specific vendor access selection will be added in a later pass.</p>
+      ${errorMessage ? `<p class="unknown">${escapeHtml(errorMessage)}</p>` : ""}
+      <form id="vendorAccessForm">
+        <label for="vendorAccessPinInput">Staff PIN</label>
+        <input id="vendorAccessPinInput" name="pin" inputmode="numeric" autocomplete="one-time-code" placeholder="Enter PIN" required />
+        <div class="runner-actions">
+          <button class="inline-btn" type="submit">Open Vendor Menu</button>
+          ${
+            session?.role === "vendor" && venueSlug
+              ? `<button class="inline-btn ghost" type="button" id="resumeVendorMenuBtn">Resume Vendor Menu</button>`
+              : ""
+          }
+        </div>
+      </form>
+    </section>
+  `;
+
+  document.getElementById("vendorAccessForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const pin = String(form.get("pin") || "").trim();
+    if (!pin) return;
+    try {
+      const vendorSession = await loginVendorWithPin(apiBase, venueSlug, pin);
+      window.location.assign(
+        buildAppEntryUrl("/menu/", {
+          role: "vendor",
+          venue: vendorSession.venue_slug,
+          api: apiBase
+        })
+      );
+    } catch (error) {
+      renderVendorAccessPage(apiBase, `Could not connect vendor account: ${error.message}`);
+    }
+  });
+
+  document.getElementById("resumeVendorMenuBtn")?.addEventListener("click", () => {
+    window.location.assign(
+      buildAppEntryUrl("/menu/", {
+        role: "vendor",
+        venue: venueSlug,
+        api: apiBase
+      })
+    );
+  });
 }
 
 function modeLine(modeName, venue) {
@@ -1276,10 +1683,6 @@ function renderVenueHero(venue, options = {}) {
       <div class="venue-hero-toolbar">
         <div class="venue-hero-toolbar-heading">
           <h1 class="venue-hero-toolbar-title">${escapeHtml(headingTitle)}</h1>
-          <span class="venue-hero-toolbar-verified" aria-label="${escapeHtml(contextChip)}">
-            <span class="venue-hero-toolbar-tick" aria-hidden="true">✓</span>
-            <span>${escapeHtml(contextChip)}</span>
-          </span>
         </div>
         ${
           toolbarButtons.length > 0
@@ -1337,6 +1740,8 @@ function addItemToCart(venueSlug, menuItem) {
     cart.push({
       item_id: menuItem.id,
       item_name: menuItem.name,
+      vendor_slug: menuItem.vendor_slug || "",
+      vendor_name: menuItem.vendor_name || "",
       price_text: menuItem.price,
       price_pennies: parsePriceToPennies(menuItem.price),
       quantity: 1
@@ -1401,7 +1806,7 @@ function bindCartSectionButtons({
     try {
       const desiredRole = role === "admin" ? "admin" : permissions.vendor ? "vendor" : permissions.venue ? "venue" : "runner";
       const ok = await loginStaff(apiBase, venueSlug, desiredRole);
-      if (ok) render();
+      if (ok) requestRender("hero-login");
     } catch (error) {
       alert(`Staff login failed: ${error.message}`);
     }
@@ -1417,15 +1822,17 @@ async function renderVenueMenu(venueSlug, venue, role, apiBase) {
   const isVendorRole = role === "vendor";
   const isVenueRole = role === "venue";
   const activeOrder = role === "customer" ? await resolveActiveCustomerOrder(apiBase, venueSlug) : null;
+  const vendorAuth = getAuthHeader(venueSlug, "vendor");
   let menuItems = venue.menuItems.map(normalizeMenuItem);
   try {
-    menuItems = await fetchMenuItems(apiBase, venueSlug);
+    menuItems = isVendorRole && vendorAuth
+      ? await fetchMenuItems(apiBase, venueSlug, { includeInactive: true, authHeader: vendorAuth })
+      : await fetchMenuItems(apiBase, venueSlug);
   } catch {
     // Fall back to static venue data if the menu API is temporarily unavailable.
   }
   const hasLockedOrder = Boolean(activeOrder?.order_id);
   const runnerAuth = getAuthHeader(venueSlug, "runner");
-  const vendorAuth = getAuthHeader(venueSlug, "vendor");
   const venueAuth = getAuthHeader(venueSlug, "venue");
   const canRunner = permissions.runner && Boolean(runnerAuth);
   const canVendor = permissions.vendor && Boolean(vendorAuth);
@@ -1440,6 +1847,12 @@ async function renderVenueMenu(venueSlug, venue, role, apiBase) {
   const reorderRound = readReorderRound(venueSlug);
   const count = itemCount(cart);
   const total = formatPennies(totalPennies(cart));
+  const firstCartItem = cart[0] || null;
+  const matchedCartVendorItem = firstCartItem
+    ? menuItems.find((item) => item.id === firstCartItem.item_id || item.item_id === firstCartItem.item_id)
+    : null;
+  const cartVendorSlug = String(firstCartItem?.vendor_slug || matchedCartVendorItem?.vendor_slug || "");
+  const cartVendorName = String(firstCartItem?.vendor_name || matchedCartVendorItem?.vendor_name || "");
   const preferredDeliveryMode =
     readPreferredDeliveryMode(venueSlug) || venue.fulfillmentModes[0]?.label || "";
   const categoryOptions = ["All", ...new Set(menuItems.map((item) => String(item.category || "").trim()).filter(Boolean))];
@@ -1469,7 +1882,7 @@ async function renderVenueMenu(venueSlug, venue, role, apiBase) {
     document.getElementById("staffLoginBtn")?.addEventListener("click", async () => {
       try {
         const ok = await loginStaff(apiBase, venueSlug, role === "admin" ? "admin" : "venue");
-        if (ok) render();
+        if (ok) requestRender("venue-role-login");
       } catch (error) {
         alert(`Staff login failed: ${error.message}`);
       }
@@ -1531,20 +1944,28 @@ async function renderVenueMenu(venueSlug, venue, role, apiBase) {
     }
     <section class="menu-grid">
       ${visibleMenuItems
-        .map(
-          (item) => `
-        <article class="item" data-item-id="${item.id}">
+        .map((item) => {
+          const isLockedToAnotherVendor =
+            isCustomerRole && Boolean(cartVendorSlug) && Boolean(item.vendor_slug) && cartVendorSlug !== item.vendor_slug;
+          return `
+        <article class="item${isLockedToAnotherVendor ? " item-vendor-locked" : ""}" data-item-id="${item.id}">
           <h3>${item.name}</h3>
           <div class="item-meta">
             <span>${item.category}</span>
             <span class="price">${item.price}</span>
           </div>
+          ${
+            item.vendor_name
+              ? `<p class="api-note">Sold by ${escapeHtml(item.vendor_name)}</p>`
+              : ""
+          }
 	          <ul class="option-list">
 	            ${item.options.map((opt) => `<li>${modeLine(opt, venue)}</li>`).join("")}
 	          </ul>
 	          ${
               isCustomerRole
-                ? `<button class="add-btn" data-add-id="${item.id}" ${hasLockedOrder ? "disabled" : ""}>
+                ? `
+              <button class="add-btn" data-add-id="${item.id}" ${hasLockedOrder || isLockedToAnotherVendor ? "disabled" : ""}>
               ${hasLockedOrder ? "Ordering Locked" : "Add To Cart"}
             </button>`
                 : canVendor && isVendorRole
@@ -1556,8 +1977,8 @@ async function renderVenueMenu(venueSlug, venue, role, apiBase) {
             `
                   : `<div class="api-note">Vendor login required to edit or delete menu items.</div>`
             }
-	        </article>`
-	        )
+	        </article>`;
+        })
 	        .join("")}
       ${
         canVendor && isVendorRole
@@ -1729,6 +2150,9 @@ async function renderCheckout(venueSlug, venue, apiBase) {
 
   const total = formatPennies(totalPennies(cart));
   const hasRememberedProfile = Boolean(savedProfile?.token);
+  const isMemberProfile = String(savedProfile?.accountLevel || "") === "member";
+  const showSaveDetailsRow = !hasRememberedProfile;
+  const showForgetDetailsRow = hasRememberedProfile && !isMemberProfile;
   const defaultCheckoutType = "remembered";
   const menuSelectedDeliveryMode = readPreferredDeliveryMode(venueSlug);
   const pendingTipAmount = readPendingTipAmount(venueSlug);
@@ -1779,21 +2203,37 @@ async function renderCheckout(venueSlug, venue, apiBase) {
     </section>
 
     <section class="form-card">
-      <h2>Contact + Delivery</h2>
-      <p class="api-note">
+      <h2>
         ${
           hasRememberedProfile
-            ? "Recognized customer profile loaded for faster checkout on this device."
-            : "Your first order creates a stored customer profile automatically so repeat checkout is faster."
+            ? `Hi ${escapeHtml(savedProfile?.name || "there")}! You've enabled faster checkout`
+            : "Contact + Delivery"
         }
+      </h2>
+      <p class="api-note checkout-recognition-note">
+        Delivery
       </p>
       <div id="accountRecognition"></div>
       <form id="checkoutForm">
         <input type="hidden" name="checkoutType" value="${defaultCheckoutType}" />
-        <div class="choice-note">
-          <strong>${hasRememberedProfile ? "Recognized customer" : "Silent registration enabled"}</strong><br />
-          Drinq stores your checkout profile after ordering so repeat checkout can prefill your details.
+        ${
+          showSaveDetailsRow
+            ? `
+        <div class="choice-note checkout-save-toggle" aria-label="Save details for faster checkout">
+          <span class="checkout-save-toggle-label">Save details for faster checkout</span>
+          <span class="checkout-save-toggle-switch" aria-hidden="true">
+            <span class="checkout-save-toggle-thumb"></span>
+          </span>
         </div>
+        `
+            : showForgetDetailsRow
+              ? `
+        <div class="choice-note checkout-save-toggle" aria-label="Forget saved checkout details">
+          <button class="inline-btn ghost" type="button" id="forgetDetailsBtn">Forget Details</button>
+        </div>
+        `
+              : ""
+        }
         <div id="nameFieldGroup">
           <label>Name</label>
           <input name="name" required placeholder="Your name" value="${escapeHtml(savedProfile?.name || "")}" />
@@ -1819,7 +2259,6 @@ async function renderCheckout(venueSlug, venue, apiBase) {
 
         <button class="add-btn" type="submit">Pay & Place Order</button>
         <button class="inline-btn ghost" type="button" id="backMenuBtn">Back To Menu</button>
-        <button class="inline-btn ghost" type="button" id="forgetDetailsBtn">Forget Saved Details</button>
       </form>
       <p class="api-note">API: ${escapeHtml(apiBase)}</p>
       <p id="checkoutMsg" class="status-msg"></p>
@@ -1863,11 +2302,13 @@ async function renderCheckout(venueSlug, venue, apiBase) {
   const emailInput = document.querySelector('input[name="email"]');
   const accountRecognition = document.getElementById("accountRecognition");
 
-  const setMemberFieldVisibility = (lookupState) => {
+  const setCheckoutFieldVisibility = (lookupState) => {
+    const isRememberedReturnCustomer = hasRememberedProfile;
     const isMember = String(lookupState?.account_level || savedProfile?.accountLevel || "") === "member";
-    nameFieldGroup?.classList.toggle("checkout-field-hidden", isMember);
-    emailFieldGroup?.classList.toggle("checkout-field-hidden", isMember);
-    if (!isMember) return;
+    const shouldHideIdentityFields = isRememberedReturnCustomer || isMember;
+    nameFieldGroup?.classList.toggle("checkout-field-hidden", shouldHideIdentityFields);
+    emailFieldGroup?.classList.toggle("checkout-field-hidden", shouldHideIdentityFields);
+    if (!shouldHideIdentityFields) return;
     if (nameInput && lookupState?.name) {
       nameInput.value = String(lookupState.name);
     }
@@ -1875,34 +2316,30 @@ async function renderCheckout(venueSlug, venue, apiBase) {
       emailInput.value = String(lookupState.email);
     }
   };
-  setMemberFieldVisibility(savedProfile?.accountLevel === "member" ? { account_level: "member" } : null);
+  setCheckoutFieldVisibility(savedProfile ? { account_level: savedProfile.accountLevel, name: savedProfile.name, email: savedProfile.email } : null);
 
   const renderAccountRecognition = (state) => {
     if (!accountRecognition) return;
     if (!state) {
       accountRecognition.innerHTML = "";
-      setMemberFieldVisibility(null);
+      setCheckoutFieldVisibility(null);
       return;
     }
     if (!state.exists) {
       accountRecognition.innerHTML = "";
-      setMemberFieldVisibility(null);
+      setCheckoutFieldVisibility(null);
       return;
     }
     if (String(state.account_level || "profile") === "member") {
       accountRecognition.innerHTML = "";
-      setMemberFieldVisibility(state);
+      setCheckoutFieldVisibility(state);
       return;
     }
-    setMemberFieldVisibility(state);
+    setCheckoutFieldVisibility(state);
     accountRecognition.innerHTML = `
       <div class="choice-note account-recognition-card">
         <strong>Finish sign up for member privileges</strong>
-        <ol class="account-steps">
-          <li>Use your recognized checkout email.</li>
-          <li>Set a password for your existing saved profile.</li>
-          <li>Unlock member privileges on future orders.</li>
-        </ol>
+        <p class="api-note">Login email: <strong>${escapeHtml(String(state.email || emailInput?.value || ""))}</strong></p>
         <label>Password</label>
         <input type="password" id="memberPasswordInput" placeholder="Create a password" minlength="8" />
         <label>Confirm Password</label>
@@ -1990,7 +2427,7 @@ async function renderCheckout(venueSlug, venue, apiBase) {
     if (!accountRecognition) return;
     if (String(emailInput.value || "").trim().toLowerCase() !== latestLookupEmail) {
       accountRecognition.innerHTML = "";
-      setMemberFieldVisibility(null);
+      setCheckoutFieldVisibility(null);
     }
   });
   if (savedProfile?.email) {
@@ -2104,6 +2541,13 @@ async function renderOrderStatus(venueSlug, orderId, apiBase, role) {
       });
     }
   } catch (error) {
+    showAppAlert({
+      title: shouldOfferDiagnosticReport(error) ? "Oops, that wasn't meant to happen." : "Could not load that order.",
+      message: normalizeBugError(error).message,
+      error,
+      source: "order-status-load",
+      reportable: shouldOfferDiagnosticReport(error)
+    });
     app.innerHTML = `
       <section class="unknown">
         Could not load order #${orderId}. ${escapeHtml(error.message)}<br />
@@ -2118,18 +2562,20 @@ function runnerActionButtons(order) {
   const status = String(order.status || "").toLowerCase();
   const nextActionByStatus = {
     ready: { status: "assigned", label: "Assign" },
-    assigned: { status: "loaded", label: "Loaded" },
     loaded: { status: "en_route", label: "En Route" },
     en_route: { status: "arrived", label: "Arrived" },
     arrived: { status: "fulfilled", label: "Fulfilled" }
   };
-  const nextAction = nextActionByStatus[status];
+  const nextAction =
+    status === "assigned" && !order.assigned_runner_token
+      ? { status: "assigned", label: "Take Over" }
+      : nextActionByStatus[status] || (status === "assigned" ? { status: "loaded", label: "Loaded" } : null);
 
   if (!nextAction) {
     return `<div class="runner-actions"><span class="api-note">No runner action available for ${escapeHtml(status)}.</span></div>`;
   }
 
-  const showCancel = ["assigned", "loaded", "en_route", "arrived"].includes(status);
+  const showCancel = Boolean(order.assigned_runner_token) && ["assigned", "loaded", "en_route", "arrived"].includes(status);
   return `
     <div class="runner-actions">
       <button class="inline-btn status-btn" type="button" data-order-id="${order.order_id}" data-status="${nextAction.status}">${nextAction.label}</button>
@@ -2146,6 +2592,9 @@ function venueStatusButtons(order, isAdmin) {
   const canReject = normalizedStatus === "received";
   const canReady = normalizedStatus === "accepted";
   const canFail = ["accepted", "ready", "assigned", "loaded", "en_route", "arrived"].includes(normalizedStatus);
+  const canFlagAttention = !["fulfilled", "collected", "uncollected", "rejected", "cancelled", "failed"].includes(normalizedStatus);
+  const canResolveAttention = Boolean(order.attention_required);
+  const canReleaseRunner = normalizedStatus === "assigned" && Boolean(order.assigned_runner_token);
   const canRefund = isAdmin && String(order.payment_status || "").toLowerCase() === "captured";
   return `
     <div class="runner-actions">
@@ -2153,6 +2602,9 @@ function venueStatusButtons(order, isAdmin) {
       <button class="inline-btn ghost venue-action-btn" data-action="reject" data-order-id="${orderId}" ${canReject ? "" : "disabled"}>Reject</button>
       <button class="inline-btn venue-action-btn" data-action="ready" data-order-id="${orderId}" ${canReady ? "" : "disabled"}>Mark Ready</button>
       <button class="inline-btn ghost venue-action-btn" data-action="fail" data-order-id="${orderId}" ${canFail ? "" : "disabled"}>Fail Order</button>
+      <button class="inline-btn ghost venue-action-btn" data-action="attention" data-order-id="${orderId}" ${canFlagAttention ? "" : "disabled"}>Flag Issue</button>
+      <button class="inline-btn ghost venue-action-btn" data-action="resolve-attention" data-order-id="${orderId}" ${canResolveAttention ? "" : "disabled"}>Resolve Alert</button>
+      <button class="inline-btn ghost venue-action-btn" data-action="release-runner" data-order-id="${orderId}" ${canReleaseRunner ? "" : "disabled"}>Release Runner</button>
       ${canRefund ? `<button class="inline-btn ghost venue-action-btn" data-action="refund" data-order-id="${orderId}">Refund</button>` : ""}
     </div>
   `;
@@ -2166,6 +2618,8 @@ function venueCollectButtons(order, isAdmin) {
   const canCollect = status === "ready_for_collection";
   const canMarkUncollected = status === "ready_for_collection";
   const canFail = ["accepted", "ready_for_collection"].includes(status);
+  const canFlagAttention = !["collected", "uncollected", "rejected", "cancelled", "failed"].includes(status);
+  const canResolveAttention = Boolean(order.attention_required);
   const canRefund = isAdmin && String(order.payment_status || "").toLowerCase() === "captured";
   return `
     <div class="runner-actions">
@@ -2175,6 +2629,8 @@ function venueCollectButtons(order, isAdmin) {
       <button class="inline-btn venue-action-btn" data-action="collect" data-order-id="${order.order_id}" data-pickup-code="${escapeHtml(order.pickup_code || "")}" ${canCollect ? "" : "disabled"}>Verify Collected</button>
       <button class="inline-btn ghost venue-action-btn" data-action="uncollected" data-order-id="${order.order_id}" ${canMarkUncollected ? "" : "disabled"}>Mark Uncollected</button>
       <button class="inline-btn ghost venue-action-btn" data-action="fail" data-order-id="${order.order_id}" ${canFail ? "" : "disabled"}>Fail Order</button>
+      <button class="inline-btn ghost venue-action-btn" data-action="attention" data-order-id="${order.order_id}" ${canFlagAttention ? "" : "disabled"}>Flag Issue</button>
+      <button class="inline-btn ghost venue-action-btn" data-action="resolve-attention" data-order-id="${order.order_id}" ${canResolveAttention ? "" : "disabled"}>Resolve Alert</button>
       ${canRefund ? `<button class="inline-btn ghost venue-action-btn" data-action="refund" data-order-id="${order.order_id}">Refund</button>` : ""}
     </div>
   `;
@@ -2196,13 +2652,16 @@ async function renderRunnerStream(venueSlug, apiBase, authHeader) {
   const venue = VENUES[venueSlug];
   const role = getRole();
   const permissions = ROLE_PERMISSIONS[role] ?? ROLE_PERMISSIONS.customer;
-  const canVendor = permissions.vendor || role === "admin";
-  const canVenue = permissions.venue || role === "admin";
-  const canRunner = permissions.runner || role === "admin";
-  const toolbarButtons = [
-    { label: "Menu", action: "route", target: "/" },
-    { label: "Stream", action: "route", target: "/runner-stream", active: true }
-  ];
+  const toolbarButtons =
+    role === "runner"
+      ? [
+          { label: "Stream", action: "route", target: "/runner-stream", active: true },
+          { label: "Runner Dashboard", action: "route", target: "/runner" }
+        ]
+      : [
+          { label: "Menu", action: "route", target: "/" },
+          { label: "Stream", action: "route", target: "/runner-stream", active: true }
+        ];
   app.innerHTML = `
     ${renderVenueHero(venue, {
       contextChip: "STREAM",
@@ -2212,22 +2671,16 @@ async function renderRunnerStream(venueSlug, apiBase, authHeader) {
       <button class="category-chip stream-action-chip" type="button" id="runnerStreamRefreshBtn">Refresh</button>
     </section>
     <section class="menu-grid stream-grid" id="runnerOrders"></section>
-    <section class="cart-mini" id="cartSection">
-      Staff role active. Checkout actions are hidden on this view.
-      ${canVendor ? `<button class="inline-btn ghost" id="goVendorOpsBtn">Vendor Ops</button>` : ""}
-      ${canVenue ? `<button class="inline-btn ghost" id="goVenueOpsBtn">Venue Ops</button>` : ""}
-      ${canRunner ? `<button class="inline-btn ghost" id="goRunnerDashboardBtn">Runner Dashboard</button>` : ""}
+    <section class="hero-tools">
       ${renderStaffSessionButton(venueSlug, role, permissions)}
     </section>
   `;
   bindHeroToolbarButtons();
-  bindCartSectionButtons({
-    venueSlug,
-    venue,
-    role,
-    permissions,
-    apiBase,
-    onChanged: () => renderRunnerStream(venueSlug, apiBase, authHeader)
+  document.getElementById("staffLoginBtn")?.addEventListener("click", async () => {
+    renderRunnerAccessPage(apiBase);
+  });
+  document.getElementById("staffLogoutBtn")?.addEventListener("click", () => {
+    handleStaffLogout();
   });
 
   document.getElementById("runnerStreamRefreshBtn")?.addEventListener("click", () => {
@@ -2253,7 +2706,9 @@ async function renderRunnerStream(venueSlug, apiBase, authHeader) {
       }
       const data = await res.json();
       const orders = (data.orders || []).filter((order) =>
-        !isClickAndCollectOrder(order) && ["ready", "assigned"].includes(String(order.status || "").toLowerCase())
+        !isClickAndCollectOrder(order) &&
+        (String(order.status || "").toLowerCase() === "ready" ||
+          (String(order.status || "").toLowerCase() === "assigned" && !order.assigned_runner_token))
       );
       return { activeOrder: null, orders };
     };
@@ -2283,9 +2738,16 @@ async function renderRunnerStream(venueSlug, apiBase, authHeader) {
   } catch (error) {
     if (isStaffSessionError(error)) {
       clearStaffSession();
-      render();
+      requestRender("runner-session-reset");
       return;
     }
+    showAppAlert({
+      title: shouldOfferDiagnosticReport(error) ? "Oops, that wasn't meant to happen." : "Could not refresh the runner stream.",
+      message: normalizeBugError(error).message,
+      error,
+      source: "runner-stream",
+      reportable: shouldOfferDiagnosticReport(error)
+    });
     container.innerHTML = `<section class="unknown">Runner stream error: ${escapeHtml(error.message)}</section>`;
   }
 }
@@ -2419,9 +2881,16 @@ async function renderVendorStream(venueSlug, apiBase, authHeader) {
   } catch (error) {
     if (isStaffSessionError(error)) {
       clearStaffSession();
-      render();
+      requestRender("vendor-session-reset");
       return;
     }
+    showAppAlert({
+      title: shouldOfferDiagnosticReport(error) ? "Oops, that wasn't meant to happen." : "Could not refresh the venue stream.",
+      message: normalizeBugError(error).message,
+      error,
+      source: "vendor-stream",
+      reportable: shouldOfferDiagnosticReport(error)
+    });
     container.innerHTML = `<section class="unknown">Venue dashboard error: ${escapeHtml(error.message)}</section>`;
     if (adminMenuContainer) {
       adminMenuContainer.innerHTML = "";
@@ -2431,10 +2900,22 @@ async function renderVendorStream(venueSlug, apiBase, authHeader) {
 
 function renderRunnerDashboardPlaceholder(venueSlug) {
   const venue = VENUES[venueSlug];
+  const role = getRole();
+  const toolbarButtons =
+    role === "runner"
+      ? [
+          { label: "Stream", action: "route", target: "/runner-stream" },
+          { label: "Runner Dashboard", action: "route", target: "/runner", active: true }
+        ]
+      : [
+          { label: "Menu", action: "route", target: "/" },
+          { label: "Runner Dashboard", action: "route", target: "/runner", active: true }
+        ];
   app.innerHTML = `
     ${renderVenueHero(venue, {
       compact: true,
       contextChip: "RUNNER DASHBOARD",
+      toolbarButtons,
       title: "Runner Dashboard",
       copy: "Runner account settings, availability controls, and operational support will live here."
     })}
@@ -2442,10 +2923,15 @@ function renderRunnerDashboardPlaceholder(venueSlug) {
       <h2>Runner Dashboard</h2>
       <p>This endpoint is intentionally reserved for the future runner dashboard.</p>
       <p class="api-note">Planned scope: account changes, availability preferences, support settings, and runner-level controls.</p>
-      <button class="inline-btn" id="runnerDashboardBackBtn">Back To Menu</button>
+      <button class="inline-btn" id="runnerDashboardBackBtn">${role === "runner" ? "Back To Stream" : "Back To Menu"}</button>
     </section>
+    ${role === "runner" ? `<section class="hero-tools">${renderStaffSessionButton(venueSlug, role, ROLE_PERMISSIONS[role] ?? ROLE_PERMISSIONS.customer)}</section>` : ""}
   `;
-  document.getElementById("runnerDashboardBackBtn")?.addEventListener("click", () => setRoute("/"));
+  bindHeroToolbarButtons();
+  document.getElementById("runnerDashboardBackBtn")?.addEventListener("click", () => setRoute(role === "runner" ? "/runner-stream" : "/"));
+  document.getElementById("staffLogoutBtn")?.addEventListener("click", () => {
+    handleStaffLogout();
+  });
 }
 
 function renderVendorOpsPlaceholder(venueSlug) {
@@ -2579,6 +3065,35 @@ async function render() {
     return;
   }
 
+  if (isVendorPortalPath()) {
+    if (getAuthHeader(venueSlug, "vendor")) {
+      window.location.assign(
+        buildAppEntryUrl("/menu/", {
+          role: "vendor",
+          venue: venueSlug,
+          api: apiBase
+        })
+      );
+    } else {
+      renderVendorAccessPage(apiBase);
+    }
+    return;
+  }
+
+  if (role === "vendor" && route.name === "menu" && !getAuthHeader(venueSlug, "vendor")) {
+    renderVendorAccessPage(apiBase);
+    return;
+  }
+
+  if (role === "runner" && route.name === "menu") {
+    if (getAuthHeader(venueSlug, "runner")) {
+      setRoute("/runner-stream");
+    } else {
+      renderRunnerAccessPage(apiBase);
+    }
+    return;
+  }
+
   if (route.name === "checkout") {
     renderCheckout(venueSlug, venue, apiBase);
     return;
@@ -2592,6 +3107,10 @@ async function render() {
       renderForbidden(role, "runner", venueSlug, apiBase);
       return;
     }
+    if (role === "runner" && !getAuthHeader(venueSlug, "runner")) {
+      renderRunnerAccessPage(apiBase);
+      return;
+    }
     renderRunnerDashboardPlaceholder(venueSlug);
     return;
   }
@@ -2602,6 +3121,10 @@ async function render() {
     }
     let authHeader = getAuthHeader(venueSlug, "runner");
     if (!authHeader) {
+      if (role === "runner") {
+        renderRunnerAccessPage(apiBase);
+        return;
+      }
       try {
         const ok = await loginStaff(apiBase, venueSlug, role === "admin" ? "admin" : "runner");
         if (!ok) {
@@ -2662,7 +3185,25 @@ async function render() {
 }
 
 window.addEventListener("hashchange", () => {
-  render();
+  requestRender("hashchange");
 });
 
-render();
+window.addEventListener("error", (event) => {
+  handleUnexpectedError(event.error || new Error(event.message || "Unexpected browser error"), "window-error");
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  event.preventDefault();
+  handleUnexpectedError(event.reason, "unhandled-rejection");
+});
+
+window.alert = (message) => {
+  showAppAlert({
+    title: "That action didn't complete.",
+    message: String(message || "Please try again."),
+    source: "alert",
+    reportable: true
+  });
+};
+
+requestRender("startup");
